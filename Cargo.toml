@@ -1,0 +1,14 @@
+[package]
+name = "mdrv-ds"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+pipewire = "0.10"
+libspa = "0.10"
+
+[profile.release]
+opt-level = 2
