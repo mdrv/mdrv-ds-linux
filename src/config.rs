@@ -15,6 +15,12 @@ use std::path::PathBuf;
 
 #[derive(Debug, Default, Deserialize)]
 pub struct Config {
+    /// "hidraw" (default — relay through the kernel hid-playstation node,
+    /// bluetoothd owns the L2CAP session) or "l2cap" (self-owned HID
+    /// session: bind PSM 0x11/0x13 ourselves, bluetoothd runs with
+    /// --noplugin=input; requires scripts/bt-input-off.sh + setcap).
+    #[serde(default)]
+    pub transport: Option<String>,
     #[serde(default)]
     pub chords: HashMap<String, String>,
     #[serde(default)]
@@ -23,6 +29,12 @@ pub struct Config {
     pub notify: NotifyConfig,
     #[serde(default)]
     pub audio: AudioConfig,
+}
+
+impl Config {
+    pub fn l2cap(&self) -> bool {
+        self.transport.as_deref() == Some("l2cap")
+    }
 }
 
 /// `[audio]` table — BT audio. USB pads already expose native USB audio;
@@ -56,6 +68,11 @@ pub struct AudioConfig {
     /// The dsneo spec shows 200 ppm session-specific clock variance between
     /// pad units; a per-pad sweep (10667→10669→…) can flatten stutter.
     pub interval_us: Option<u64>,
+    /// false → do not spawn the BT audio/haptics sink at all. Kernel 0x31s
+    /// (rumble/LED) are then relayed directly by the proxy — the pre-audio
+    /// code path. Diagnostic: isolates whether the sink's writer detour
+    /// (queue + unified-seq restamp) causes rumble micro-stutter.
+    pub sink: Option<bool>,
 }
 
 /// `[notify]` table — event callback for chord fires. The command runs via

@@ -3,13 +3,10 @@
 
 use std::fs::File;
 use std::io::Write;
-use std::os::unix::io::AsRawFd;
 
 pub const UHID_DESTROY: u32 = 1;
 pub const UHID_START: u32 = 2;
 pub const UHID_STOP: u32 = 3;
-pub const UHID_OPEN: u32 = 4;
-pub const UHID_CLOSE: u32 = 5;
 pub const UHID_OUTPUT: u32 = 6;
 pub const UHID_GET_REPORT: u32 = 9;
 pub const UHID_GET_REPORT_REPLY: u32 = 10;
@@ -109,7 +106,7 @@ pub enum UhidEvent<'a> {
     GetReport(u32, u8),
     /// (request id, report number, report bytes)
     SetReport(u32, u8, &'a [u8]),
-    Other(u32),
+    Other(#[allow(dead_code)] u32),
 }
 
 pub fn parse_event(ev: &[u8]) -> UhidEvent<'_> {
@@ -185,6 +182,3 @@ fn set_cstr(buf: &mut [u8], off: usize, max: usize, s: &str) {
     buf[off..off + n].copy_from_slice(&bytes[..n]);
 }
 
-pub fn fd_of(f: &File) -> i32 {
-    f.as_raw_fd()
-}

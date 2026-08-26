@@ -28,6 +28,7 @@ const SEND_INTERVAL: Duration = Duration::from_nanos(10_666_667); // 480/45000
 const REPORT_0X35: usize = 334;
 const REPORT_0X39: usize = 547;
 const REPORT_0X31: usize = 78;
+const REPORT_0X32: usize = 142;
 
 // ---- libopus (system) ------------------------------------------------------
 
@@ -42,9 +43,9 @@ extern "C" {
     fn opus_encoder_destroy(st: *mut libc::c_void);
     fn opus_encode(
         st: *mut libc::c_void,
-        pcm: *const libc::int16_t,
+        pcm: *const i16,
         frame_size: libc::c_int,
-        data: *mut libc::uint8_t,
+        data: *mut u8,
         max_data_bytes: libc::c_int,
     ) -> libc::c_int;
     fn opus_encoder_ctl(st: *mut libc::c_void, request: libc::c_int, ...) -> libc::c_int;
@@ -165,11 +166,30 @@ pub fn audio_report(seq: u8, counter: u8, frame: &[u8; OPUS_BYTES], jack: bool) 
     r[1] = seq << 4;
     r[2] = 0x91; // 0x11 | sized — control sub-packet
     r[3] = 0x07; // len
-    r[4] = 0xFE; // audio enable mask (mic off)
+    r[4] = 0xFE; // flags0: bits 0,1 REQUIRED for pad operation; bits 4-7: allow volumes/audio
     r[9] = counter; // += 2 per report, wraps
     r[11] = if jack { 0x96 } else { 0x93 }; // 0x16 | sized / 0x13 | sized
     r[12] = 0xC8; // 200
     r[13..213].copy_from_slice(frame);
+    put_crc(&mut r);
+    r
+}
+
+/// 0x32 (142 B) carrying control + one 64 B haptics PCM frame, NO Opus —
+/// the SAxense-style haptics-only stream (dsneo §3.1: `0x11` + `0x12`,
+/// no audio TLV). Hardware-verified shape: dsneo §2.2.2 buzzed the pad
+/// with 25 such reports. 57% less airtime than 0x35, 74% less than 0x39.
+pub fn haptics_report_0x32(seq: u8, counter: u8, hap: &[u8; 64]) -> Vec<u8> {
+    let mut r = vec![0u8; REPORT_0X32];
+    r[0] = 0x32;
+    r[1] = seq << 4;
+    r[2] = 0x91; // 0x11 | sized — control
+    r[3] = 0x07; // len
+    r[4] = 0xFE; // flags0: bits 0,1 REQUIRED for pad operation; bits 4-7: allow volumes/audio
+    r[9] = counter;
+    r[11] = 0x92; // 0x12 | sized — haptics PCM
+    r[12] = 0x40; // 64
+    r[13..77].copy_from_slice(hap);
     put_crc(&mut r);
     r
 }
@@ -182,7 +202,7 @@ pub fn audio_report_0x39(seq: u8, counter: u8, frame: &[u8; OPUS_BYTES], jack: b
     r[1] = seq << 4;
     r[2] = 0x91; // 0x11 | sized — control sub-packet
     r[3] = 0x07; // len
-    r[4] = 0xFE; // audio enable mask (mic off)
+    r[4] = 0xFE; // flags0: bits 0,1 REQUIRED for pad operation; bits 4-7: allow volumes/audio
     r[9] = counter;
     r[11] = if jack { 0x96 } else { 0x93 };
     r[12] = 0xC8; // 200
@@ -191,45 +211,85 @@ pub fn audio_report_0x39(seq: u8, counter: u8, frame: &[u8; OPUS_BYTES], jack: b
     r
 }
 
-/// 0x39 (547 B) carrying two 200 B Opus frames (twoFrames mode).
+// ---- L2CAP dialect (vds parity, takeover26-29 proven) -----------------------
+
+/// Session-open INIT: 0x32 (142 B) with a FIXED seq 0x10 and a 63 B state
+/// TLV (0x90/63). Proven by vdsd on every session open.
+pub fn init_report_032(state63: &[u8; 63]) -> Vec<u8> {
+    let mut r = vec![0u8; REPORT_0X32];
+    r[0] = 0x32;
+    r[1] = 0x10; // FIXED sequence (own family — never shared with 0x31/0x36)
+    r[2] = 0x90; // 0x10 | sized — state sub-packet
+    r[3] = 63; // len
+    r[4..67].copy_from_slice(state63);
+    put_crc(&mut r);
+    r
+}
+
+/// Mic report 0x32 (142 B), own sequence family: opens/closes the pad mic.
+/// vdsd sends mic-open before audio starts. `mic_seq` is echoed at [4] and
+/// [10]; the caller increments it after each send.
+pub fn mic_report_032(mic_seq: u8, active: bool) -> Vec<u8> {
+    let mut r = vec![0u8; REPORT_0X32];
+    r[0] = 0x32;
+    r[1] = mic_seq << 4;
+    r[2] = 0x91; // 0x11 | sized — control
+    r[3] = 0x07;
+    r[4] = if active { 0xFF } else { 0xFE }; // mic open / close
+    r[5] = 64; // audio buffer length ×5 (kBtAudioBufferLength)
+    r[6] = 64;
+    r[7] = 64;
+    r[8] = 64;
+    r[9] = 64;
+    r[10] = mic_seq;
+    r[11] = 0x92; // 0x12 | sized — haptics
+    r[12] = 0x40; // 64
+    put_crc(&mut r);
+    r
+}
+
+/// 0x36 (398 B) vds-dialect audio report — THE proven L2CAP format.
 ///
-/// Layout (dsneo §3 + DS5Dongle header bit 6):
-///   [0]=0x39 [1]=seq<<4
-///   [2..10]  control TLV: 0x91, len=7, flag0|counter|zeros
-///   [11..140] haptics TLV: 0xD2 (0x12|twoFrames|sized), len=128, 2×64B
-///   [141..542] speaker TLV: 0xD6 (0x16|twoFrames|sized), len=200, 2×200B
-///   [543..546] CRC-32 LE
+///   [2..10]   control TLV: 0x91, len 7, 0xFF (audio sections enable),
+///             buffer length 64×5, packet counter
+///   [11..76]  state TLV: 0x90, len 63, full 63 B state (speaker path etc.)
+///   [76..142] haptics TLV: 0x92, len 64, s8 3 kHz interleaved L/R
+///   [142..144] speaker block: 0x93 speaker / 0x96 jack (| sized), len 200
+///   [144..344] Opus CBR 200 B
+///   [394..398] CRC-32 LE
 ///
-/// When the `twoFrames` header bit is set the pad reads 2× the length byte
-/// for that TLV, giving us two 10 ms Opus frames per report — halving the
-/// report rate from 94 to 47/s and dramatically reducing ACL packet count.
-pub fn audio_report_0x39_dual(
+/// Sent with a 0xA2 HIDP prefix on the interrupt channel at a flat 10 ms.
+pub const REPORT_0X36_BT: usize = 398;
+
+pub fn audio_report_036_bt(
     seq: u8,
     counter: u8,
-    hap1: &[u8; 64],
-    hap2: &[u8; 64],
-    frame1: &[u8; OPUS_BYTES],
-    frame2: &[u8; OPUS_BYTES],
+    state63: &[u8; 63],
+    hap: &[u8; 64],
+    frame: &[u8; OPUS_BYTES],
     jack: bool,
 ) -> Vec<u8> {
-    let mut r = vec![0u8; REPORT_0X39];
-    r[0] = 0x39;
+    let mut r = vec![0u8; REPORT_0X36_BT];
+    r[0] = 0x36;
     r[1] = seq << 4;
-    // Control TLV
-    r[2] = 0x91; // 0x11 | sized
-    r[3] = 0x07; // len
-    r[4] = 0xFE; // audio enable mask (mic off)
-    r[9] = counter;
-    // Haptics TLV — twoFrames (bit 6) + sized (bit 7)
-    r[11] = 0xD2; // 0x12 | 0x40 | 0x80
-    r[12] = 128; // 2 × 64
-    r[13..77].copy_from_slice(hap1);
-    r[77..141].copy_from_slice(hap2);
-    // Speaker TLV — twoFrames + sized
-    r[141] = if jack { 0xD6 } else { 0xD3 }; // 0x16|0xC0 / 0x13|0xC0
-    r[142] = 200; // per-frame; pad reads 2 × len when twoFrames set
-    r[143..343].copy_from_slice(frame1);
-    r[343..543].copy_from_slice(frame2);
+    r[2] = 0x91; // 0x11 | sized — control
+    r[3] = 0x07;
+    r[4] = 0xFF; // audio sections enable (mic included; vdsd always sends this)
+    r[5] = 64; // buffer length ×5
+    r[6] = 64;
+    r[7] = 64;
+    r[8] = 64;
+    r[9] = 64;
+    r[10] = counter; // packet counter, += 1 per report (wraps u8)
+    r[11] = 0x90; // 0x10 | sized — state
+    r[12] = 63; // len
+    r[13..76].copy_from_slice(state63);
+    r[76] = 0x92; // 0x12 | sized — haptics PCM
+    r[77] = 64;
+    r[78..142].copy_from_slice(hap);
+    r[142] = if jack { 0x96 } else { 0x93 }; // 0x16 | sized / 0x13 | sized
+    r[143] = 200;
+    r[144..344].copy_from_slice(frame);
     put_crc(&mut r);
     r
 }

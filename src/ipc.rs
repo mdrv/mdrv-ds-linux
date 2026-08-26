@@ -15,7 +15,6 @@
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -30,7 +29,6 @@ pub const TAG_OUTPUT: u8 = b'O';
 pub const TAG_GET_REQ: u8 = b'Q';
 pub const TAG_SET_REQ: u8 = b'T';
 pub const TAG_NOTICE: u8 = b'X';
-
 const MAX_FRAME: usize = 16384;
 
 pub fn sock_path() -> PathBuf {
@@ -127,7 +125,7 @@ pub fn decode_create(p: &[u8]) -> Option<CreateMsg> {
         let s = &p[*i..end];
         *i = end;
         Some(s)
-    };
+    }
     let bus = u16::from_le_bytes(take(p, &mut i, 2)?.try_into().ok()?);
     let vendor = u32::from_le_bytes(take(p, &mut i, 4)?.try_into().ok()?);
     let product = u32::from_le_bytes(take(p, &mut i, 4)?.try_into().ok()?);

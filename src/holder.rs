@@ -123,6 +123,7 @@ impl Holder {
             }
             ipc::TAG_GET_REPLY => {
                 if let Some((id, err, rdata)) = ipc::dec_get_reply(data) {
+                    eprintln!("holder: get_reply id={id} err={err} len={}", rdata.len());
                     if let Some(u) = self.uhid.as_mut() {
                         let _ = uhid::reply_get_report(u, id, err, &rdata);
                     }
@@ -198,13 +199,14 @@ impl Holder {
             }
         }
     }
+
 }
 
 pub fn run() -> i32 {
     unsafe {
-        libc::signal(libc::SIGTERM, on_signal as libc::sighandler_t);
-        libc::signal(libc::SIGINT, on_signal as libc::sighandler_t);
-        libc::signal(libc::SIGHUP, on_signal as libc::sighandler_t); // ignored
+        libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGHUP, on_signal as *const () as libc::sighandler_t); // ignored
     }
     crate::proxy::tee_stderr_to_file("holder.log");
     if ipc::connect().is_ok() {
@@ -290,5 +292,6 @@ pub fn run() -> i32 {
         if h.uhid.is_some() && fds[2].revents & libc::POLLIN != 0 {
             h.uhid_event(&mut client);
         }
+
     }
 }

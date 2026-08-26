@@ -3,6 +3,7 @@ mod config;
 mod hid;
 mod holder;
 mod ipc;
+mod l2cap;
 mod mouse;
 mod proxy;
 mod sink;

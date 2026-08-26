@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+r"""ds5-haptics-patch — enable DualSense audio-haptics over Bluetooth for specific
+Windows games running under Wine/Proton, by patching the gate checks that stop
+the games' DualSense audio-endpoint shoppers / pad libraries from working when
+the controller is not genuinely USB-connected.
+
+Profiles
+    ff16         FINAL FANTASY XVI (ffxvi.exe)
+                 The game re-inits its audio devices only when the WASAPI render
+                 endpoint count changes after launch; over BT it never does, so
+                 the DualSense endpoint shopper never runs. Four conditional
+                 jumps guarding shopper Init (fn @VA 0x1410410a0) are NOPed so
+                 the shopper always runs and finds the "...Wireless Controller"
+                 endpoint (our PipeWire sink impersonation).
+
+    stellarblade Stellar Blade (Engine/Binaries/ThirdParty/LibScePad_PS5/bin/
+                 libScePad.dll)
+                 Sony's libScePad classifies a pad as Bluetooth unless a HID
+                 caps probe succeeds, and scePadIsSupportedAudioFunction()
+                 returns false for BT pads -> no haptics/speaker. The `jle`
+                 that routes DS5 pads down the BT path (@VA 0x18000463c) is
+                 NOPed (classification stays Bluetooth so BT-shaped reports
+                 parse correctly), and the bus check in
+                 scePadIsSupportedAudioFunction (@VA 0x18000ae30) is NOPed so
+                 BT pads get haptics/speaker.
+
+    ge-winepulse GE-Proton winepulse.so: get_container_id() stubbed to return
+                 a constant container GUID for every audio endpoint (virtual
+                 endpoints have no udev usb_device parent, so Wine derived
+                 GUID_NULL and the game's pad<->endpoint container match
+                 always failed).
+
+    ge-winebus   GE-Proton winebus.sys: make_unique_container_id() patched to
+                 stamp the pad with the same constant GUID every reconnect,
+                 plus the bus_type_str[] "BTHENUM" entry rewritten to "USB"
+                 so the pad's Windows device ancestry reads USB\VID_....
+
+Usage
+    ds5-haptics-patch [status|patch|restore] [profile...] [--path FILE]
+
+    status   (default) show per-site state; all profiles if none given
+    patch    back up (<file>.hapticsbak) and apply
+    restore  copy the backup back over the target
+    --path   explicit binary path (overrides profile default)
+
+Requires: python-pefile (pacman -S python-pefile) — only for the PE-based
+profiles (ff16, stellarblade); the ge-* profiles use raw file offsets.
+"""
+
+import argparse
+import os
+import shutil
+import sys
+
+try:
+    import pefile
+except ImportError:
+    pefile = None
+
+# (name, default path, imagebase, [(va, orig_hex, repl_hex)], doc)
+PROFILES = {
+    "ff16": dict(
+        path="/mnt/label/ESD380C-E4/n/games/pc/finalfantasyxvi/prefix/drive_c/"
+             "Games/FINAL FANTASY XVI/ffxvi.exe",
+        base=0x140000000,
+        nop=b"\x90",
+        sites=[
+            (0x141041135, "0f853c030000", "909090909090"),
+            (0x141041148, "0f8e29030000", "909090909090"),
+            (0x141041159, "0f8818030000", "909090909090"),
+            (0x14104117a, "0f88f7020000", "909090909090"),
+        ],
+        doc="NOP the four shopper-Init gate jumps (endpoint-count/bus checks)",
+    ),
+    "stellarblade": dict(
+        path="/mnt/label/ESD380C-E4/n/games/pc/stellarblade/prefix/drive_c/"
+             "Games/Stellar Blade/Engine/Binaries/ThirdParty/LibScePad_PS5/bin/"
+             "libScePad.dll",
+        base=0x180000000,
+        sites=[
+            # audio gate only: NOP the jne after `cmp [ctx+0x64],0` in
+            # scePadIsSupportedAudioFunction so BT-classified pads get
+            # haptics/speaker. Classification itself stays natural (HID caps
+            # probe): BT rdesc -> BT (parses 0x31 reports), USB rdesc -> USB.
+            # Forcing classification broke whichever transport it didn't match.
+            (0x18000ae30, "397364755a", "3973649090"),
+        ],
+        doc="grant audio function to BT-classified pads (classification natural)",
+    ),
+    # --- GE-Proton companion patches (raw file-offset sites; ELF or PE) ---
+    #
+    # The mdrv-ds PipeWire sink impersonates the DualSense USB audio device
+    # (device.bus=usb, vendor/product 054c:0ce6, sysfs.path). These two
+    # binary patches give BOTH sides of the Wine container-ID match a fixed
+    # GUID {0CE6054C-0000-FFFF-C0FF-EE0CE6054C00}:
+    #
+    #   winepulse.so get_container_id() normally derives an endpoint's
+    #   container from the udev usb_device parent (PRODUCT/BUSNUM/DEVNUM/
+    #   USEC_INITIALIZED); virtual endpoints have no such parent and got
+    #   GUID_NULL. The stub returns the constant for every endpoint.
+    #
+    #   winebus.sys make_unique_container_id() stamps the pad with a fresh
+    #   tick-based GUID per reconnect; patched to the same constant.
+    #
+    #   Plus: bus_type_str[] "BTHENUM" -> "USB" so the pad's Windows
+    #   ancestry reads USB\VID_054C&PID_0CE6\... (games walking
+    #   CM_Get_Parent see a USB parent).
+    #
+    # Haptics were verified working WITH all three installed; they were
+    # never isolated one-by-one. Do not selectively revert without testing.
+    "ge-winepulse": dict(
+        path="/home/ua/.config/heroic/tools/proton/GE-Proton-latest/files/"
+             "lib/wine/x86_64-unix/winepulse.so",
+        raw=True,
+        sites=[
+            (0x7240,
+             "554889e541574156415541544989fc534881ec2810",
+             "48b84c05e60c0000ffff48bac0ffee0ce6054c00c3"),
+        ],
+        doc="get_container_id stub -> constant DualSense container GUID",
+    ),
+    "ge-winebus": dict(
+        path="/home/ua/.config/heroic/tools/proton/GE-Proton-latest/files/"
+             "lib/wine/x86_64-windows/winebus.sys",
+        raw=True,
+        sites=[
+            # make_unique_container_id store sequence -> constant GUID
+            (0x1ab2,
+             "0fb74644488d4dd8c1e21009d00fb796a00600008986900600000fb7"
+             "4650c1e01009d0898694060000ff157fc80000488b45d84889869806"
+             "0000",
+             "c786900600004c05e60cc786940600000000ffff48b8c0ffee0ce605"
+             "4c004889869806000090909090909090909090909090909090909090"
+             "9090"),
+            # bus_type_str[] entry: UTF-16LE "BTHENUM" -> "USB" + NUL padding
+            (0xa364,
+             "42005400480045004e0055004d000000",
+             "55005300420000000000000000000000"),
+        ],
+        doc="constant pad container GUID + USB ancestry string",
+    ),
+}
+
+
+def va_to_offset(pe, imagebase, va):
+    for sec in pe.sections:
+        start = imagebase + sec.VirtualAddress
+        size = max(sec.SizeOfRawData, sec.Misc_VirtualSize)
+        if start <= va < start + size:
+            return va - start + sec.PointerToRawData
+    return None
+
+
+def site_state(data, off, orig, repl):
+    cur = data[off : off + len(orig)]
+    if cur == orig:
+        return "original", cur
+    if cur == repl:
+        return "patched", cur
+    return "MISMATCH", cur
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("action", nargs="?", default="status",
+                    choices=["status", "patch", "restore"])
+    ap.add_argument("profile", nargs="?", default=None, choices=list(PROFILES))
+    ap.add_argument("--path", help="explicit target binary path")
+    args = ap.parse_args()
+
+    names = [args.profile] if args.profile else list(PROFILES)
+    rc = 0
+    for name in names:
+        prof = PROFILES[name]
+        target = args.path or prof["path"]
+        bak = target + ".hapticsbak"
+
+        if args.action == "restore":
+            if not os.path.exists(bak):
+                print(f"[{name}] no backup at {bak} — nothing to restore")
+                rc = 1
+                continue
+            shutil.copy2(bak, target)
+            print(f"[{name}] restored {target} from {bak}")
+            continue
+
+        if not os.path.exists(target):
+            print(f"[{name}] target missing: {target}")
+            rc = 1
+            continue
+
+        data = bytearray(open(target, "rb").read())
+        states = []
+        for site in prof["sites"]:
+            va, orig_hex = site[0], site[1]
+            site_repl = site[2] if len(site) > 2 else None
+            if prof.get("raw"):
+                off = va
+                orig = bytes.fromhex(orig_hex)
+                repl = bytes.fromhex(site_repl)  # raw sites always carry repl
+            else:
+                if pefile is None:
+                    print(f"[{name}] error: python-pefile required "
+                          f"(pacman -S python-pefile)")
+                    rc = 1
+                    break
+                pe = pefile.PE(target, fast_load=True)
+                base = pe.OPTIONAL_HEADER.ImageBase
+                off = va_to_offset(pe, base, va)
+                if off is None:
+                    print(f"[{name}] {va:#x}: VA not in any section")
+                    rc = 1
+                    break
+                orig = bytes.fromhex(orig_hex)
+                repl = bytes.fromhex(site_repl if site_repl else prof["repl"])
+            state, cur = site_state(data, off, orig, repl)
+            states.append((va, off, orig, repl, state, cur))
+        else:
+            label = ", ".join(f"{va:#x}:{st}" for va, _, _, _, st, _ in states)
+            print(f"[{name}] {os.path.basename(target)}  {prof['doc']}")
+            print(f"[{name}]   {label}")
+
+            if args.action == "status":
+                all_p = all(st == "patched" for *_, st, _ in states)
+                all_o = all(st == "original" for *_, st, _ in states)
+                print(f"[{name}]   => {'PATCHED' if all_p else 'UNPATCHED' if all_o else 'PARTIAL/MISMATCH'}")
+                continue
+
+            if args.action == "patch":
+                if any(st == "MISMATCH" for *_, st, _ in states):
+                    print(f"[{name}] ERROR: bytes differ from known original/patched "
+                          f"— game updated? Aborting.")
+                    rc = 1
+                    continue
+                if all(st == "patched" for *_, st, _ in states):
+                    print(f"[{name}] already patched")
+                    continue
+                if not os.path.exists(bak):
+                    shutil.copy2(target, bak)
+                    print(f"[{name}] backup written: {bak}")
+                changed = False
+                for va, off, orig, repl, st, _ in states:
+                    if st == "original":
+                        data[off : off + len(orig)] = repl
+                        changed = True
+                        print(f"[{name}] patched {va:#x} (file offset {off:#x}): "
+                              f"{orig.hex()} -> {repl.hex()}")
+                    else:
+                        print(f"[{name}] kept    {va:#x} (already patched)")
+                if changed:
+                    with open(target, "r+b") as f:
+                        f.write(data)
+                    print(f"[{name}] PATCHED OK")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

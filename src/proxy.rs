@@ -22,6 +22,7 @@ use crate::audio;
 use crate::config;
 use crate::hid::{self, PadInfo, Transport};
 use crate::ipc;
+use crate::l2cap;
 use crate::mouse;
 use crate::sink;
 use crate::uhid;
@@ -47,9 +48,9 @@ extern "C" fn on_signal(sig: libc::c_int) {
 
 fn install_signal_handlers() {
     unsafe {
-        libc::signal(libc::SIGTERM, on_signal as libc::sighandler_t);
-        libc::signal(libc::SIGINT, on_signal as libc::sighandler_t);
-        libc::signal(libc::SIGHUP, on_signal as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGHUP, on_signal as *const () as libc::sighandler_t);
     }
 }
 
@@ -441,6 +442,22 @@ fn layout_for(transport: Transport) -> InputLayout {
     }
 }
 
+/// MDRV_DUMP_INPUT capture helper: appends `usb <hex>` / `raw <hex>` lines.
+fn dump_input(out: &mut Option<(std::fs::File, usize)>, rpt: &[u8], raw: &[u8]) {
+    use std::io::Write;
+    let Some((f, n)) = out else { return };
+    if *n >= 200_000 {
+        return;
+    }
+    *n += 1;
+    let _ = writeln!(
+        f,
+        "usb {} raw {}",
+        hid::hex(rpt),
+        hid::hex(&raw[..raw.len().min(78)])
+    );
+}
+
 /// All-neutral input report for a transport (USB only — BT input reports
 /// carry a CRC the receiving driver validates).
 fn neutral_report(l: &InputLayout) -> Option<Vec<u8>> {
@@ -453,6 +470,10 @@ fn neutral_report(l: &InputLayout) -> Option<Vec<u8>> {
         r[i] = 0x80;
     }
     r[l.btn0] = 0x08; // hat neutral
+                      // Battery nibble: 0 would report "5% discharging" (kernel: n*10+5) and
+                      // trigger low-battery notifications before real reports arrive. Use
+                      // 0x0A (=100%), matching the kernel's initial power_supply value.
+    r[53] = 0x0A;
     Some(r)
 }
 
@@ -473,17 +494,64 @@ pub fn run(opts: ProxyOpts) -> i32 {
         eprintln!("config: ps=swallow (PS hidden from games/mdrv-gm)");
     }
     // Persistent-virtual-pad state moved into the holder daemon.
+    // A cabled DualSense (USB hidraw) never shows up on L2CAP — USB forces
+    // wired mode. When one is present (or appears while we wait on the PSM
+    // listeners), serve it through the hidraw path instead and keep the PSMs
+    // unbound for the next BT session.
+    let usb_pad_present = || {
+        opts.pad.is_none()
+            && hid::find_pads()
+                .iter()
+                .any(|(_, _, t)| *t == Transport::Usb)
+    };
+
     loop {
-        let (mut real, info) = match open_real(&opts.pad) {
-            OpenReal::Ok(f, i) => (f, i),
-            OpenReal::Waiting => {
-                eprintln!("waiting for DualSense…");
-                std::thread::sleep(Duration::from_secs(2));
-                continue;
+        // `ctrl` (L2CAP control channel) must outlive the whole session:
+        // dropped only when relay_loop returns and the session is torn down.
+        let (mut real, mut ctrl, info, mut l2cap_features) = if cfg.l2cap() && !usb_pad_present() {
+            match l2cap::open(&|| EXIT.load(Ordering::Relaxed) || usb_pad_present()) {
+                Ok(session) => {
+                    eprintln!(
+                        "proxy: L2CAP session open (rdesc={}B, features={})",
+                        session.info.rdesc.len(),
+                        session.features.len()
+                    );
+                    let features = session.features;
+                    (
+                        session.intr,
+                        Some(session.ctrl),
+                        session.info,
+                        Some(features),
+                    )
+                }
+                Err(e) => {
+                    if EXIT.load(Ordering::Relaxed) {
+                        return proxy_exit(&mut tone, &mut audio_sink);
+                    }
+                    if usb_pad_present() {
+                        eprintln!("proxy: USB DualSense detected — hidraw session");
+                        continue; // loop top takes the hidraw branch below
+                    }
+                    eprintln!("{e}");
+                    std::thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
             }
-            OpenReal::Masked(msg) => {
-                eprintln!("FATAL: {msg}");
-                return 1;
+        } else {
+            match open_real(&opts.pad) {
+                OpenReal::Ok(f, i) => (f, None, i, None),
+                OpenReal::Waiting => {
+                    if EXIT.load(Ordering::Relaxed) {
+                        return proxy_exit(&mut tone, &mut audio_sink);
+                    }
+                    eprintln!("waiting for DualSense…");
+                    std::thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+                OpenReal::Masked(msg) => {
+                    eprintln!("FATAL: {msg}");
+                    return 1;
+                }
             }
         };
         eprintln!(
@@ -498,6 +566,8 @@ pub fn run(opts: ProxyOpts) -> i32 {
         let virtual_uniq = derive_virtual_mac(&info.uniq);
         let virtual_mac: [u8; 6] =
             parse_mac(&virtual_uniq).unwrap_or([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01]);
+        // Chords/gating speak the transport's native layout — the virtual
+        // pad presents it natively in both modes.
         let layout = layout_for(info.transport);
 
         // The virtual pad lives in the holder daemon (see holder.rs) and
@@ -514,14 +584,20 @@ pub fn run(opts: ProxyOpts) -> i32 {
             }
         };
         let msg = ipc::CreateMsg {
+            // BT-native presentation: FF16 accepts input ONLY from a pad that
+            // is genuinely Bluetooth end-to-end (bus=BLUETOOTH + BT rdesc +
+            // 0x31 frames). A USB-ancestry chimera was rejected by both the
+            // input path and the haptics gate (tested 19:41 build).
             bus: match info.transport {
-                Transport::Usb => uhid::BUS_USB,
-                Transport::Bluetooth => uhid::BUS_BLUETOOTH,
+                crate::hid::Transport::Usb => uhid::BUS_USB,
+                _ => uhid::BUS_BLUETOOTH,
             },
             vendor: DS_VENDOR,
             product: DS_PRODUCT,
             version: info.fw_version,
-            name: "mdrv-ds Virtual DualSense".to_string(),
+            // Exact stock name: games (FF7R/FF16) name-match "DualSense
+            // Wireless Controller" for DualSense-specific input routing.
+            name: "DualSense Wireless Controller".to_string(),
             uniq: virtual_uniq.clone(),
             rdesc: info.rdesc.clone(),
         };
@@ -565,9 +641,19 @@ pub fn run(opts: ProxyOpts) -> i32 {
         // all clients of the device, so this silences libinput fds opened
         // before we masked the node (masking only blocks future opens).
         // Kept alive for this connection's whole lifetime.
-        let _touchpad_grab = mouse::grab_permanently(&mouse::touchpad_nodes_of(&info.path));
+        // L2CAP: no hidraw device to hide or grab.
+        // Session, not config: a cabled pad served through the hidraw path
+        // (even with transport="l2cap") must still hide/grab like before.
+        let session_is_l2cap = ctrl.is_some();
+        let _touchpad_grab = if !session_is_l2cap {
+            Some(mouse::grab_permanently(&mouse::touchpad_nodes_of(
+                &info.path,
+            )))
+        } else {
+            None
+        };
 
-        let hidden: Vec<PathBuf> = if opts.hide {
+        let hidden: Vec<PathBuf> = if !session_is_l2cap && opts.hide {
             let mut nodes = vec![info.path.clone()];
             nodes.extend(hid::pad_evdev_nodes(&info.path));
             for n in &nodes {
@@ -627,16 +713,18 @@ pub fn run(opts: ProxyOpts) -> i32 {
             s.stop();
         }
         audio_sink = None;
-        if matches!(info.transport, Transport::Bluetooth) {
+        if matches!(info.transport, Transport::Bluetooth) && cfg.audio.sink != Some(false) {
             audio_sink = Some(sink::start(
                 &real,
                 &cfg.audio,
                 &hid::feature_lengths(&info.rdesc),
+                ctrl.is_some(),
             ));
         }
 
         let code = relay_loop(
             &mut real,
+            ctrl.as_mut(),
             &mut sock,
             &info,
             &gate,
@@ -644,6 +732,8 @@ pub fn run(opts: ProxyOpts) -> i32 {
             &virtual_mac,
             &mut chords,
             &mut ps_swallow,
+            session_is_l2cap,
+            l2cap_features.as_mut(),
         );
         // Undo the real pad's node masking; the virtual pad itself is owned
         // by the holder and outlives this proxy process.
@@ -679,6 +769,21 @@ enum OpenReal {
     Masked(String),
 }
 
+/// Clean shutdown while waiting for a pad (no session is live): stop the
+/// test tone / audio sink, drop the pidfile. The holder keeps the virtual
+/// pad alive across proxy exits.
+fn proxy_exit(tone: &mut Option<audio::Tone>, audio_sink: &mut Option<sink::Sink>) -> i32 {
+    eprintln!("proxy: exit (virtual pad kept alive by holder)");
+    if let Some(t) = tone.as_mut() {
+        t.stop();
+    }
+    if let Some(s) = audio_sink.as_mut() {
+        s.stop();
+    }
+    remove_pidfile();
+    0
+}
+
 fn open_real(explicit: &Option<String>) -> OpenReal {
     let picked = match explicit {
         Some(p) => Some(p.clone()),
@@ -711,6 +816,9 @@ fn open_real(explicit: &Option<String>) -> OpenReal {
 
 fn relay_loop(
     real: &mut File,
+    // L2CAP control channel (PSM 0x11); polled and drained for the whole
+    // session (vds parity) - 0xA3 feature replies refresh `features`.
+    mut ctrl: Option<&mut File>,
     sock: &mut UnixStream,
     info: &PadInfo,
     gate: &Arc<AtomicBool>,
@@ -718,15 +826,43 @@ fn relay_loop(
     virtual_mac: &[u8; 6],
     chords: &mut ChordState,
     ps_swallow: &mut bool,
+    l2cap: bool,
+    mut features: Option<&mut std::collections::HashMap<u8, Vec<u8>>>,
 ) -> i32 {
+    // The virtual pad carries the transport's NATIVE descriptor on L2CAP
+    // (BT presentation — see run()), so everything downstream speaks the
+    // BT layout.
     let layout = layout_for(info.transport);
     let flens = hid::feature_lengths(&info.rdesc);
     let real_fd = real.as_raw_fd();
     let sock_fd = sock.as_raw_fd();
+    // fd < 0 makes poll(2) ignore the entry (POSIX) — used when no ctrl.
+    let ctrl_fd = ctrl.as_ref().map(|c| c.as_raw_fd()).unwrap_or(-1);
     let mut in_buf = [0u8; 512];
+    let mut ctrl_buf = [0u8; 1024];
+    // Input pacing (L2CAP): forward at most one report per pace window
+    // (default 12 ms, real-USB cadence), MDRV_INPUT_PACE_US to override.
+    let pace_ns: u64 = std::env::var("MDRV_INPUT_PACE_US")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(12_000)
+        * 1000;
+    let now0 = std::time::Instant::now();
+    let mut last_fwd = now0
+        .checked_sub(std::time::Duration::from_secs(1))
+        .unwrap_or(now0);
+    let mut input_dump = std::env::var("MDRV_DUMP_INPUT").ok().and_then(|p| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)
+            .ok()
+            .map(|f| (f, 0usize))
+    });
     let mut eofs: u32 = 0;
 
     loop {
+        let now = std::time::Instant::now();
         let mut fds = [
             libc::pollfd {
                 fd: real_fd,
@@ -735,6 +871,11 @@ fn relay_loop(
             },
             libc::pollfd {
                 fd: sock_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: ctrl_fd,
                 events: libc::POLLIN,
                 revents: 0,
             },
@@ -752,7 +893,8 @@ fn relay_loop(
                 if *ps_swallow { "swallow" } else { "pass" }
             );
         }
-        let ret = uhid::poll(&mut fds, 250);
+        let timeout_ms: i32 = 250;
+        let ret = uhid::poll(&mut fds, timeout_ms);
         if ret < 0 {
             let e = std::io::Error::last_os_error();
             if e.raw_os_error() == Some(libc::EINTR) {
@@ -767,16 +909,31 @@ fn relay_loop(
             match real.read(&mut in_buf) {
                 Ok(n) if n > 0 => {
                     eofs = 0;
-                    let mut report = in_buf[..n].to_vec();
+                    // L2CAP: raw frames arrive with a 0xA1 HIDP header byte
+                    // prepended; strip it so the rest of the relay path sees
+                    // the same report-id-first layout as hidraw.
+                    let raw = &in_buf[..n];
+                    let mut report = if l2cap && raw.first() == Some(&0xA1) {
+                        raw[1..].to_vec()
+                    } else {
+                        raw.to_vec()
+                    };
                     // Jack detect for the BT audio sink: input 0x31 byte 56
                     // bit0 (kernel dualsense_input_report.status[1]; the
-                    // spec's "byte 55" is off by one). Inert on USB (0x01).
+                    // spec's "byte 55" is off by one). Read from the BT frame
+                    // BEFORE translation. Inert on USB (0x01).
                     if report.len() > 56 && report[0] == 0x31 {
                         sink::JACK_PLUGGED.store(report[56] & 0x01 != 0, Ordering::Relaxed);
-                        // Mic-variant 0x31s (audio sections enabled, low
-                        // nibble 0x03) are Opus mic data the kernel misparses
-                        // as button presses — never relay them.
-                        if report[1] & 0x0F == 0x03 {
+                    }
+                    // L2CAP native passthrough: the virtual pad carries the
+                    // BT descriptor, so control frames relay verbatim in
+                    // their native 0x31 shape. Audio/mic payloads (byte-1
+                    // low nibble 0x02/0x03) and other frames are dropped —
+                    // the kernel would misparse them as input.
+                    if l2cap {
+                        let control =
+                            report.len() >= 65 && report[0] == 0x31 && report[1] & 0x0F == 0x01;
+                        if !control {
                             continue;
                         }
                     }
@@ -792,13 +949,26 @@ fn relay_loop(
                     // PS allowlist: "swallow" strips the PS bit from every
                     // relayed report, so games/mdrv-gm never see PS at
                     // all — only mdrv-ds chords (fed above, raw) do.
-                    if *ps_swallow {
-                        report[layout.btn0 + 2] &= !0x01;
+                    if report.len() > layout.btn0 + 2 {
+                        if *ps_swallow {
+                            report[layout.btn0 + 2] &= !0x01;
+                        }
                     }
                     if gate.load(Ordering::Relaxed) {
                         gate_input(&mut report, &layout);
                     } else if opts.deadzone {
                         clamp_sticks(&mut report, &layout);
+                    }
+                    if l2cap {
+                        dump_input(&mut input_dump, &report, &in_buf[..n]);
+                        // USB-like cadence: real USB pads deliver a report
+                        // every ~12 ms; the pad's BT high-rate mode bursts
+                        // every ~1.4 ms. Full-state reports mean pacing only
+                        // adds ≤12 ms latency, no event loss.
+                        if now.duration_since(last_fwd).as_nanos() < pace_ns as u128 {
+                            continue;
+                        }
+                        last_fwd = now;
                     }
                     if ipc::send(sock, ipc::TAG_INPUT, &report).is_err() {
                         return 3;
@@ -825,19 +995,37 @@ fn relay_loop(
         if fds[1].revents & libc::POLLIN != 0 {
             match ipc::recv(sock) {
                 Ok((ipc::TAG_OUTPUT, data)) => {
-                    if opts.verbose && !data.is_empty() {
+                    if !data.is_empty() {
                         eprintln!("out ({}B): {}", data.len(), hid::hex(&data));
                     }
                     // On BT with the audio sink running, hand kernel output
                     // reports to the sink writer so ALL interrupt-channel
                     // reports share one sequence counter (two independent
                     // counters make the pad drop reports — rumble AND audio).
-                    if info.transport == Transport::Bluetooth
+                    // L2CAP: kernel outputs arrive as 48 B USB 0x02 reports
+                    // (virtual pad carries the USB rdesc; [1..48] = 47 B
+                    // state); hidraw BT keeps feeding 78 B 0x31s. Both go to
+                    // the sink writer so ALL interrupt-channel reports share
+                    // one sequence counter (two independent counters make
+                    // the pad drop reports — rumble AND audio).
+                    let bt_state = info.transport == Transport::Bluetooth
                         && data.len() == 78
-                        && data.first() == Some(&0x31)
-                        && sink::enqueue_output(&data)
-                    {
+                        && data.first() == Some(&0x31);
+                    // Merged-rdesc pad on L2CAP: kernel/game may emit 48 B
+                    // USB 0x02 outputs (report 0x02 declared in the USB part
+                    // of the merged rdesc). Accept ≥48 B 0x02 shapes; the
+                    // sink extracts the 47 B state from either shape.
+                    let usb_state = l2cap && data.len() >= 48 && data.first() == Some(&0x02);
+                    if bt_state && sink::enqueue_output(&data) {
                         // sent via the sink writer
+                    } else if usb_state && sink::enqueue_output(&data[..48]) {
+                        // sent via the sink writer
+                    } else if l2cap {
+                        eprintln!(
+                            "l2cap: dropped unexpected output shape ({}B): {}",
+                            data.len(),
+                            hid::hex(&data[..data.len().min(8)])
+                        );
                     } else if let Err(e) = real.write_all(&data) {
                         eprintln!("hidraw write output: {e}");
                     }
@@ -849,7 +1037,80 @@ fn relay_loop(
                     if opts.verbose {
                         eprintln!("get_report 0x{rnum:02x}");
                     }
-                    // Unknown ids and write-only reports (e.g. 0x0c) get a
+                    // L2CAP: serve directly from the features cache filled
+                    // during Session::open (no hidraw to forward to).
+                    if l2cap {
+                        eprintln!(
+                            "get_report 0x{rnum:02x}: cache {}B",
+                            features
+                                .as_ref()
+                                .and_then(|f| f.get(&rnum))
+                                .map(|v| v.len())
+                                .unwrap_or(0)
+                        );
+                        if let Some(feat) = features.as_ref().and_then(|f| f.get(&rnum)) {
+                            let mut data = feat.clone();
+                            if (rnum == 0x09 || rnum == 0x0b) && data.len() >= 7 {
+                                for i in 0..6 {
+                                    data[1 + i] = virtual_mac[5 - i];
+                                }
+                                // MAC rewrite invalidates the trailing CRC —
+                                // restamp (kernel seed-0xA3 form).
+                                fix_bt_feature_crc_kernel(&mut data);
+                            }
+                            eprintln!(
+                                "get_report 0x{rnum:02x} (bt): {}B: {}",
+                                data.len(),
+                                hid::hex(&data)
+                            );
+                            let _ = ipc::send(
+                                sock,
+                                ipc::TAG_GET_REPLY,
+                                &ipc::enc_get_reply(id, 0, &data),
+                            );
+                        } else if let Some(c) = ctrl.as_mut() {
+                            // Probe-time cache miss: fetch from the pad over
+                            // the ctrl channel (blocks the relay ≤ ~1.5 s).
+                            eprintln!("get_report 0x{rnum:02x}: cache miss — fetching from pad");
+                            match l2cap::fetch_feature_once(c, rnum) {
+                                Some(mut data) => {
+                                    if let Some(f) = features.as_deref_mut() {
+                                        f.insert(rnum, data.clone());
+                                    }
+                                    if (rnum == 0x09 || rnum == 0x0b) && data.len() >= 7 {
+                                        for i in 0..6 {
+                                            data[1 + i] = virtual_mac[5 - i];
+                                        }
+                                        // MAC rewrite invalidates the trailing
+                                        // CRC — restamp (kernel seed-0xA3 form).
+                                        fix_bt_feature_crc_kernel(&mut data);
+                                    }
+                                    let _ = ipc::send(
+                                        sock,
+                                        ipc::TAG_GET_REPLY,
+                                        &ipc::enc_get_reply(id, 0, &data),
+                                    );
+                                }
+                                None => {
+                                    eprintln!("get_report 0x{rnum:02x}: pad did not answer");
+                                    let _ = ipc::send(
+                                        sock,
+                                        ipc::TAG_GET_REPLY,
+                                        &ipc::enc_get_reply(id, libc::EINVAL as u16, &[]),
+                                    );
+                                }
+                            }
+                        } else {
+                            eprintln!("get_report 0x{rnum:02x}: not in L2CAP features cache");
+                            let _ = ipc::send(
+                                sock,
+                                ipc::TAG_GET_REPLY,
+                                &ipc::enc_get_reply(id, libc::EINVAL as u16, &[]),
+                            );
+                        }
+                        continue;
+                    }
+                    // hidraw: unknown ids and write-only reports (e.g. 0x0c) get a
                     // negative reply; everything else forwards to the real
                     // pad with the exact rdesc-derived length.
                     match flens.get(&rnum) {
@@ -858,26 +1119,19 @@ fn relay_loop(
                             match hid::get_feature(real, rnum, &mut buf) {
                                 Ok(n) => {
                                     let mut data = buf[..n].to_vec();
-                                    // 0x09 (pairing) and 0x0b (identity)
-                                    // embed the pad MAC reversed at [1..7].
-                                    // hid-playstation dedups pads by this
-                                    // MAC — leak the real one and the
-                                    // virtual pad dies with -EEXIST.
                                     if (rnum == 0x09 || rnum == 0x0b) && data.len() >= 7 {
                                         for i in 0..6 {
                                             data[1 + i] = virtual_mac[5 - i];
                                         }
-                                        // Over Bluetooth hid-playstation
-                                        // validates a CRC32 (seed 0xA3,
-                                        // kernel ps_check_crc32) over the
-                                        // report with the LE32 result in
-                                        // the last 4 bytes — the rewrite
-                                        // above just invalidated the pad's
-                                        // own CRC, so recompute it.
                                         if info.transport == Transport::Bluetooth {
                                             fix_bt_feature_crc(&mut data);
                                         }
                                     }
+                                    eprintln!(
+                                        "get_report 0x{rnum:02x} (usb): {}B: {}",
+                                        data.len(),
+                                        hid::hex(&data)
+                                    );
                                     let _ = ipc::send(
                                         sock,
                                         ipc::TAG_GET_REPLY,
@@ -912,18 +1166,67 @@ fn relay_loop(
                     let Some((id, rnum, data)) = ipc::dec_set_req(&p) else {
                         continue;
                     };
-                    if opts.verbose {
-                        eprintln!(
-                            "set_report 0x{rnum:02x} ({}B): {}",
-                            data.len(),
-                            hid::hex(&data)
-                        );
-                    }
+                    eprintln!(
+                        "set_report 0x{rnum:02x} req ({}B): {}",
+                        data.len(),
+                        hid::hex(&data)
+                    );
                     // On BT the kernel emits its 0x31 outputs as SET_REPORT;
                     // route them through the sink writer unified sequence (same
                     // as TAG_OUTPUT) or the shared seq counter breaks and the
                     // pad drops rumble AND audio.
-                    let err: u16 = if info.transport == Transport::Bluetooth
+                    let err: u16 = if l2cap {
+                        if data.len() == 78
+                            && data.first() == Some(&0x31)
+                            && sink::enqueue_output(&data)
+                        {
+                            // legacy kernel BT-format state (bus=USB now,
+                            // but keep the shape working)
+                            0
+                        } else {
+                            // Feature SET on L2CAP. Forwarding to the pad was
+                            // disabled after it killed the ctrl channel — but
+                            // that was always combined with the constant
+                            // silence-0x36 stream (now gated). Retest vds
+                            // parity: 0x53 + report with the feature CRC
+                            // re-stamped in place. MDRV_SWALLOW_SET=1 falls
+                            // back to the old swallow-with-ACK behavior.
+                            if std::env::var("MDRV_SWALLOW_SET").is_ok() {
+                                eprintln!(
+                                    "set_report 0x{rnum:02x} ({}B) swallowed: {}",
+                                    data.len(),
+                                    hid::hex(&data)
+                                );
+                                0
+                            } else {
+                                let mut body = data.clone();
+                                fix_bt_feature_crc(&mut body);
+                                let sent = match ctrl.as_mut() {
+                                    Some(c) => {
+                                        let a = c.write_all(&[0x53]);
+                                        let b = if a.is_ok() {
+                                            c.write_all(&body)
+                                        } else {
+                                            Ok(())
+                                        };
+                                        a.is_ok() && b.is_ok()
+                                    }
+                                    None => false,
+                                };
+                                if sent {
+                                    eprintln!(
+                                        "set_report 0x{rnum:02x} ({}B) forwarded to ctrl: {}",
+                                        data.len(),
+                                        hid::hex(&body)
+                                    );
+                                    0
+                                } else {
+                                    eprintln!("set_report 0x{rnum:02x} forward failed — ctrl gone");
+                                    libc::EIO as u16
+                                }
+                            }
+                        }
+                    } else if info.transport == Transport::Bluetooth
                         && data.len() == 78
                         && data.first() == Some(&0x31)
                         && sink::enqueue_output(&data)
@@ -932,9 +1235,7 @@ fn relay_loop(
                     } else {
                         match real.write_all(&data) {
                             Ok(()) => {
-                                if opts.verbose {
-                                    eprintln!("set_report 0x{rnum:02x} relayed ({}B)", data.len());
-                                }
+                                eprintln!("set_report 0x{rnum:02x} relayed ({}B)", data.len());
                                 0
                             }
                             Err(e) => {
@@ -943,7 +1244,6 @@ fn relay_loop(
                             }
                         }
                     };
-                    let _ = ipc::send(sock, ipc::TAG_SET_ACK, &ipc::enc_ack(id, err));
                     let _ = ipc::send(sock, ipc::TAG_SET_ACK, &ipc::enc_ack(id, err));
                 }
                 Ok((ipc::TAG_NOTICE, m)) => {
@@ -962,11 +1262,53 @@ fn relay_loop(
             return 3;
         }
 
+        // L2CAP control channel: keep it drained for the whole session
+        // (vds handle_bt_control): every 0xA3 frame is cached — unprompted
+        // too — so later GET_REQs are served fresh; other frames logged.
+        // A closed/erroring ctrl channel means the pad tore the HID session
+        // down: reconnect.
+        if ctrl.is_some() {
+            if fds[2].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                eprintln!("l2cap: control channel closed — session gone");
+                return 1;
+            }
+            if fds[2].revents & libc::POLLIN != 0 {
+                let c = ctrl.as_mut().unwrap();
+                match c.read(&mut ctrl_buf) {
+                    Ok(0) => {
+                        eprintln!("l2cap: control channel EOF — session gone");
+                        return 1;
+                    }
+                    Ok(n) => {
+                        let frame = &ctrl_buf[..n];
+                        if frame.len() >= 2 && frame[0] == 0xA3 {
+                            let id = frame[1];
+                            let rep = frame[1..].to_vec();
+                            eprintln!("l2cap: ctrl feature 0x{id:02x} ({} B) cached", rep.len());
+                            if let Some(f) = features.as_deref_mut() {
+                                f.insert(id, rep);
+                            }
+                        } else {
+                            eprintln!("l2cap: ctrl frame ({} B): {}", n, hid::hex(frame));
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("l2cap: ctrl read: {e}");
+                        return 1;
+                    }
+                }
+            }
+        }
+
         if fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
             // Real pad gone: return 1 — run() drops the holder socket at the
             // end of this cycle, and the holder relays the stored NEUTRAL
             // report then (kernel state can never freeze at last-pressed
             // values, even across proxy restarts).
+            eprintln!(
+                "real pad fd hangup: POLLHUP|POLLERR revents={} — pad dropped the link",
+                fds[0].revents
+            );
             return 1;
         }
     }
@@ -1024,24 +1366,53 @@ fn read_gate(path: &Path) -> bool {
     }
 }
 
-/// Toggle the locally-administered bit so the virtual MAC differs from the
-/// real one (hid-playstation dedups pads by MAC).
-/// Recompute the Bluetooth feature-report CRC32 the way hid-playstation
-/// validates it (ps_check_crc32): crc32_le(0xFFFFFFFF, [0xA3]) continued
-/// over the report bytes, complemented, stored LE in the last 4 bytes.
+/// Recompute the Bluetooth feature-report CRC32 the vds way (host→pad SET
+/// packets): crc32_seeded over the report bytes with seed 0xeada2d49's
+/// equivalent init, complemented, stored LE in the last 4 bytes.
 fn fix_bt_feature_crc(buf: &mut [u8]) {
     if buf.len() < 5 {
         return;
     }
-    let mut crc = 0xFFFF_FFFFu32;
-    for b in std::iter::once(0xA3u8).chain(buf[..buf.len() - 4].iter().copied()) {
-        crc ^= b as u32;
+    let crc = bt_feature_crc(&buf[..buf.len() - 4]);
+    let n = buf.len();
+    buf[n - 4..n].copy_from_slice(&crc.to_le_bytes());
+}
+
+/// Sony feature-report CRC over `data` (report id first, no 0xA3/0x53 prefix):
+/// crc32_seeded(data, 0x2060efc3) complemented — the LE value the pad expects
+/// in the trailing 4 bytes of a feature report.
+fn bt_feature_crc(data: &[u8]) -> u32 {
+    let mut crc = 0xDF9F_103Cu32;
+    for b in data {
+        crc ^= *b as u32;
         for _ in 0..8 {
             crc = (crc >> 1) ^ (0xEDB8_8320 & if crc & 1 != 0 { u32::MAX } else { 0 });
         }
     }
+    !crc
+}
+
+/// Kernel-convention feature CRC (hid-playstation ps_check_crc32, seed byte
+/// 0xA3): standard reflected CRC32 of [0xA3] ++ data, complemented — the LE
+/// value the KERNEL expects in the trailing 4 bytes of a BT feature reply.
+fn bt_feature_crc_kernel(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for b in std::iter::once(&0xA3u8).chain(data.iter()) {
+        crc ^= *b as u32;
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xEDB8_8320 & if crc & 1 != 0 { u32::MAX } else { 0 });
+        }
+    }
+    !crc
+}
+
+fn fix_bt_feature_crc_kernel(buf: &mut [u8]) {
     let n = buf.len();
-    buf[n - 4..n].copy_from_slice(&(!crc).to_le_bytes());
+    if n < 5 {
+        return;
+    }
+    let crc = bt_feature_crc_kernel(&buf[..n - 4]);
+    buf[n - 4..n].copy_from_slice(&crc.to_le_bytes());
 }
 
 fn derive_virtual_mac(real: &str) -> String {

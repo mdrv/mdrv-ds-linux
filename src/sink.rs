@@ -42,7 +42,6 @@ use libspa::pod::{Object, Pod, Value};
 use libspa::utils::{Direction, SpaTypes};
 
 pub const FRAME_SAMPLES: usize = 480; // 10 ms @ 48 k label
-const NOMINAL_INTERVAL_NS: u64 = 10_666_667; // 480/45000
 /// Ring target fill (480-sample frames) — absorbs jitter between the graph
 /// clock and the paced writer.
 /// Ring target: 4 frames ≈ 40 ms of buffered audio. Kept low on purpose —
@@ -82,9 +81,9 @@ extern "C" {
     fn opus_encoder_destroy(st: *mut libc::c_void);
     fn opus_encode(
         st: *mut libc::c_void,
-        pcm: *const libc::int16_t,
+        pcm: *const i16,
         frame_size: libc::c_int,
-        data: *mut libc::uint8_t,
+        data: *mut u8,
         max_data_bytes: libc::c_int,
     ) -> libc::c_int;
     fn opus_encoder_ctl(st: *mut libc::c_void, request: libc::c_int, ...) -> libc::c_int;
@@ -166,10 +165,10 @@ const STATE_INIT: [u8; 47] = {
     s[9] = 0x0F; // power-save control
     s[37] = 0x01; // audio_control2 (preamp 1)
     s[38] = 0x07;
-    s[42] = 0x02;
-    s[43] = 0x01;
-    s[45] = 0xFF;
-    s[46] = 0xD7;
+    s[41] = 0x02;
+    s[42] = 0x01;
+    s[44] = 0xFF;
+    s[45] = 0xD7;
     s
 };
 
@@ -308,14 +307,21 @@ fn restamp_kernel_output(report: &mut [u8], seq: u8) {
 }
 
 /// Entry point called from the proxy when transport == Bluetooth.
-pub fn start(real: &File, cfg: &AudioConfig, flens: &std::collections::HashMap<u8, usize>) -> Sink {
+pub fn start(
+    real: &File,
+    cfg: &AudioConfig,
+    flens: &std::collections::HashMap<u8, usize>,
+    l2cap: bool,
+) -> Sink {
     let stop = Arc::new(AtomicBool::new(false));
     let quit_ptr = Arc::new(AtomicUsize::new(0));
     let mut handles = Vec::new();
 
     // vds keeps the ACL link warm by polling feature reports {0x09, 0x20,
     // 0x05} every 5 s; a link that naps mid-stream is a stutter source.
-    {
+    // (hidraw mode only: on L2CAP the pad naps nothing — v29 streamed 30 s
+    // with no polls and the socket is not an hidraw anyway.)
+    if !l2cap {
         let fd = unsafe { libc::dup(real.as_raw_fd()) };
         let mut file = unsafe { File::from_raw_fd(fd) };
         let p_stop = stop.clone();
@@ -361,13 +367,20 @@ pub fn start(real: &File, cfg: &AudioConfig, flens: &std::collections::HashMap<u
     let w_shared = shared.clone();
     let w_stop = stop.clone();
     let bitrate = cfg.bitrate.unwrap_or(160_000).clamp(6_000, 510_000);
-    let combined = cfg.report.as_deref() == Some("0x36");
+    let combined = l2cap || cfg.report.as_deref() == Some("0x36");
     let report_id: u8 = match cfg.report.as_deref() {
         Some("0x36") => 0x36,
         Some("0x39") => 0x39,
         _ => 0x35,
     };
-    let interval_us = cfg.interval_us.unwrap_or(10667);
+    // The pad consumes 480-sample Opus frames at its 45 kHz slot clock (one
+    // per ~10.667 ms — dsneo 480/45000; hidraw-era sweep confirmed on this
+    // pad). vds hits the same cadence indirectly: its 10 ms is only a rate
+    // LIMIT, the real pacing is USB-audio production (512-frame windows @
+    // 48 kHz = 10.667 ms/block). Our metronom must be the 45 kHz trim on
+    // every transport; a flat 10 ms overfeeds the pad by 6.25% and the
+    // periodic pad-buffer drops sound like constant stutter.
+    let interval_us = cfg.interval_us.unwrap_or(10_667);
     let hp_volume = cfg.volume.unwrap_or(0x64);
     let force_speaker = cfg.speaker == Some(true);
     let output = cfg.output;
@@ -383,6 +396,7 @@ pub fn start(real: &File, cfg: &AudioConfig, flens: &std::collections::HashMap<u
             combined,
             report_id,
             interval_us,
+            l2cap,
         )
     }));
 
@@ -422,6 +436,20 @@ fn pw_thread(
         // 10 ms quantum: haptic feedback latency = quantum + ring + opus frame;
         // the default (1024/48k ≈ 21 ms) is felt as rumble trailing the action.
         *pw::keys::NODE_LATENCY => "480/48000",
+        // Impersonate the DualSense USB audio device so Wine's winepulse
+        // classifies this endpoint as the controller's (games like FF16
+        // gate audio-based haptics + secondary audio on finding it).
+        // Read back by upstream fill_device_info(): PA_PROP_DEVICE_BUS /
+        // DEVICE_VENDOR_ID / DEVICE_PRODUCT_ID.
+        "device.bus" => "usb",
+        "device.vendor.id" => "054c",
+        "device.product.id" => "0ce6",
+        // winepulse's pulse_add_device only queries get_container_id (GE
+        // ds5-haptic patch) when a `sysfs.path` proplist key exists; without
+        // it the endpoint registers with a NULL container and games cannot
+        // match it to the pad. The patched winepulse stub ignores the value.
+        "sysfs.path" => "/devices/pci-0000:00:14.0/usb3/3-2/3-2:1.0",
+        "device.profile.description" => "DualSense Wireless Controller",
     };
     let stream: StreamRc = match StreamRc::new(
         core.clone(),
@@ -567,16 +595,33 @@ fn pw_thread(
 /// included) so the periodic unlock re-assert never zeroes live values.
 /// vds-style coalescing: at most ONE rumble-bearing report is relayed per
 /// wake (latest wins) — FF envelope ramp floods collapse into the cadence.
+///
+/// L2CAP mode (vds parity): while idle, kernel 0x31s overlay the tracked
+/// 63 B state and a plain 0x31 (shared seq) is relayed ONLY when the 47 B
+/// state changed — forward_bt_state_if_changed. The old v12-14 "plain 0x31
+/// is dead" claim predated the unified sequence numbering; vds relays real
+/// 0x31s this way. `last_state47` mirrors what the pad last received (0x31
+/// relays and 0x36-embedded state alike) for the change detection.
 fn flush_kernel_outputs(
     file: &mut File,
     shared: &Shared,
     seq: &mut u8,
     state: &mut [u8; 47],
+    state63: &mut [u8; 63],
+    last_state47: &mut [u8; 47],
     hp_volume: u8,
     output: bool,
+    force_speaker: bool,
     streaming: bool,
     combined: bool,
+    l2cap: bool,
 ) -> bool {
+    let write_l2cap = |file: &mut File, report: &[u8]| -> bool {
+        let mut wire = Vec::with_capacity(report.len() + 1);
+        wire.push(0xA2);
+        wire.extend_from_slice(report);
+        file.write_all(&wire).is_ok()
+    };
     let mut dropped_keepalive = 0u64;
     let mut pending_rumble: Option<Vec<u8>> = None;
     loop {
@@ -586,22 +631,71 @@ fn flush_kernel_outputs(
             .unwrap_or_else(|e| e.into_inner())
             .pop_front();
         let Some(mut rpt) = item else { break };
-        if streaming && rpt.len() == 78 && rpt[0] == 0x31 {
-            // Track ALL state (keep-alives carry LEDs/mic config too).
-            state.copy_from_slice(&rpt[3..50]);
-            merge_audio_state(state, hp_volume, output, false);
-            if combined {
-                // rides the next 0x36 state TLV — nothing to relay
-            } else if rpt[3] & 0x03 != 0 {
-                pending_rumble = Some(rpt); // coalesce: latest wins
+        // Kernel outputs: 78 B BT 0x31 (hidraw BT virtual pad, state at
+        // [3..50]) or 48 B USB 0x02 (L2CAP virtual pad carries the USB
+        // rdesc; state at [1..48]) — both decode to the same 47 B state.
+        let st47: Option<[u8; 47]> = if rpt.len() == 78 && rpt[0] == 0x31 {
+            Some(rpt[3..50].try_into().unwrap())
+        } else if rpt.len() == 48 && rpt[0] == 0x02 {
+            Some(rpt[1..48].try_into().unwrap())
+        } else {
+            None
+        };
+        if let Some(st) = st47 {
+            if streaming {
+                if l2cap {
+                    // Overlay kernel 47 B verbatim (flag0 carries the kernel's
+                    // own rumble-valid bits — vds apply_usb_output_report) and
+                    // keep the 63 B tail; it rides the next 0x36.
+                    state63[..47].copy_from_slice(&st);
+                    sink_merge63(state63, hp_volume, output, !force_speaker);
+                } else {
+                    // Track ALL state (keep-alives carry LEDs/mic config too).
+                    state.copy_from_slice(&st);
+                    merge_audio_state(state, hp_volume, output, false);
+                    if combined {
+                        // rides the next 0x36 state TLV — nothing to relay
+                    } else if st[0] & 0x03 != 0 {
+                        pending_rumble = Some(rpt); // coalesce: latest wins
+                    } else {
+                        dropped_keepalive += 1;
+                        if dropped_keepalive % 32 == 1 {
+                            eprintln!("sink: absorbed {dropped_keepalive} non-rumble outputs during audio (browser/Proton keep-alives)");
+                        }
+                    }
+                }
+            } else if l2cap {
+                // idle: overlay + relay a plain 0x31, only if state changed
+                state63[..47].copy_from_slice(&st);
+                sink_merge63(state63, hp_volume, output, !force_speaker);
+                if state63[..47] != *last_state47 {
+                    let mut st47b = [0u8; 47];
+                    st47b.copy_from_slice(&state63[..47]);
+                    let report = crate::audio::state_report(*seq, &st47b);
+                    *seq = (*seq + 1) & 0x0F;
+                    if !write_l2cap(file, &report) {
+                        eprintln!("sink: relay write failed — pad gone?");
+                        return false;
+                    }
+                    *last_state47 = st47b;
+                }
             } else {
-                dropped_keepalive += 1;
-                if dropped_keepalive % 32 == 1 {
-                    eprintln!("sink: absorbed {dropped_keepalive} non-rumble 0x31s during audio (browser/Proton keep-alives)");
+                // idle hidraw: relay as-is with unified sequence
+                restamp_kernel_output(&mut rpt, *seq);
+                *seq = (*seq + 1) & 0x0F;
+                if let Err(e) = file.write_all(&rpt) {
+                    eprintln!("sink: relay write failed ({e}) — pad gone?");
+                    return false;
                 }
             }
+        } else if l2cap {
+            // unexpected shape: prefix-relay verbatim (no restamp)
+            if !write_l2cap(file, &rpt) {
+                eprintln!("sink: relay write failed — pad gone?");
+                return false;
+            }
         } else {
-            // idle (or unexpected shape): relay as-is with unified sequence
+            // hidraw unexpected shape: relay as-is with unified sequence
             restamp_kernel_output(&mut rpt, *seq);
             *seq = (*seq + 1) & 0x0F;
             if let Err(e) = file.write_all(&rpt) {
@@ -622,6 +716,18 @@ fn flush_kernel_outputs(
     true
 }
 
+/// L2CAP: overlay volume/path config on the 63 B observed state. Only the
+/// output-gated volumes and the path bits change — the observed tail bytes
+/// (preamp 0x03, LED/fade bytes) are v29-proven and left untouched.
+pub fn sink_merge63(state: &mut [u8; 63], hp_volume: u8, output: bool, jack: bool) {
+    state[4] = if output { hp_volume.min(0x7F) } else { 0 };
+    state[5] = if output { 0x64 } else { 0 };
+    // OUTPUT_PATH_SEL (mask 0x30): 0x30 speaker, 0x00 jack — matches the
+    // 0x93/0x96 TLV byte the writer picked for this frame.
+    let path = if jack { 0x00 } else { 0x30 };
+    state[7] = (state[7] & !0x30) | path;
+}
+
 fn writer_thread(
     file: &mut File,
     shared: &Shared,
@@ -633,30 +739,78 @@ fn writer_thread(
     combined: bool,
     report_id: u8,
     interval_us: u64,
+    l2cap: bool,
 ) {
     // 0x35/0x39 mode rides a fixed 200 B Opus frame (dsneo-proven shape).
     let bitrate = if combined { bitrate } else { 160_000 };
     let bytes_per_frame = (bitrate / 800) as usize; // 10 ms CBR
     let interval_ns = interval_us * 1000;
-    let mode_name = match report_id {
-        0x36 => "0x36 combined",
-        0x39 => "0x39 single-frame",
-        _ => "0x35 dsneo-proven",
+    // Pad slot clock is 45 kHz on every transport (dsneo 480/45000; see
+    // start()): consume 512 input samples per 480-sample output frame.
+    let ratio = 16.0f64 / 15.0;
+    // Debug capture (v15 replay experiment): MDRV_DUMP_REPORTS=<path> appends
+    // "<monotonic ns> <hex>" per audio report written to the pad.
+    let mut dump = std::env::var("MDRV_DUMP_REPORTS").ok().and_then(|p| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&p)
+            .map_err(|e| eprintln!("sink: dump open failed: {e}"))
+            .ok()
+    });
+    let dump_t0 = std::time::Instant::now();
+    let mut wdump = |file: &mut File, report: &[u8]| -> bool {
+        if let Some(df) = dump.as_mut() {
+            let mut hx = String::with_capacity(report.len() * 2);
+            for b in report {
+                hx.push_str(&format!("{b:02x}"));
+            }
+            let _ = writeln!(df, "{} {}", dump_t0.elapsed().as_nanos(), hx);
+        }
+        file.write_all(report).is_ok()
     };
-    let mut enc = match Encoder::new(bitrate) {
-        Some(e) => e,
-        None => return,
+    // output=false + non-combined = haptics-only: stream 142 B 0x32 reports
+    // (control + 0x12 PCM, no Opus TLV — SAxense shape, dsneo §3.1/§2.2.2).
+    // The PipeWire sink still exists, so game haptic feedback still routes
+    // through the rear channels; only the audio sections stay off.
+    let haptics_only = !output && !combined && !l2cap;
+    let mode_name = if l2cap {
+        "0x36 L2CAP (vds dialect)"
+    } else if haptics_only {
+        "0x32 haptics-only (no audio)"
+    } else {
+        match report_id {
+            0x36 => "0x36 combined",
+            0x39 => "0x39 single-frame",
+            _ => "0x35 dsneo-proven",
+        }
     };
+    let enc = Encoder::new(bitrate);
+    if !haptics_only && enc.is_none() {
+        return;
+    }
     eprintln!(
         "sink: writer started ({mode_name}, opus CBR {bitrate} bps = {bytes_per_frame} B/frame, interval {interval_us} us)"
     );
 
-    // Resampler: 48k input → 45k output (ratio 16/15), linear interpolation.
+    // Pad slot clock is 45 kHz on every transport (see start()): resample
+    // 48k input → 45k output (ratio 16/15), linear interpolation, so 512
+    // input samples become one 480-sample frame per ~10.667 ms — exact
+    // real-time consumption of the PipeWire stream at the pad's pace.
     // in_buf holds interleaved QUAD input samples (FL FR RL RR); in_pos is a
     // fractional position in input FRAMES. Ch0/1 feed the Opus speaker path;
     // ch2/3 (haptics) are box-averaged 16:1 into s8 PCM for the 0x12 TLV.
     let mut state = STATE_INIT;
     merge_audio_state(&mut state, hp_volume, output, false);
+    // L2CAP: tracked 63 B state starts from the vds pristine init (the same
+    // state the session INIT 0x32 carried); kernel rumble/LED overlays land
+    // in its first 47 B via flush_kernel_outputs, then it rides every 0x36.
+    let mut state63 = crate::l2cap::BT_STATE_INIT;
+    sink_merge63(&mut state63, hp_volume, output, !force_speaker);
+    // 47 B state the pad last received (0x31 relay or 0x36-embedded) — the
+    // idle change-detection mirror (vds last_sent_bt_state).
+    let mut last_state47 = [0u8; 47];
+    let mut mic_seq: u8 = 0; // own family (v28 handshake)
     let mut in_pos: f64 = 0.0;
     let mut in_buf: Vec<f32> = Vec::with_capacity(4096);
     let mut pcm = [0i16; FRAME_SAMPLES * 2];
@@ -674,6 +828,11 @@ fn writer_thread(
     // and starting a new play on a full buffer crackles from the first second.
     let mut primed = false;
     let mut starved_frames: u32 = 0;
+    // Silence gating (vds parity): the pad's input-report cadence degrades
+    // while 0x36 audio packets stream, so only stream REAL audio —
+    // PipeWire delivers silence frames even when nothing plays.
+    let silence_eps = 0.0005f32;
+    let mut silent_windows: u32 = 0;
     let mut stat_underruns = 0u64;
     let mut stat_overflows = 0u64;
     let mut stat_fill_min = i64::MAX;
@@ -686,7 +845,7 @@ fn writer_thread(
     // state in the combined report, no real 0x31 ever reaches the pad —
     // which correlates exactly with the total-silence regression.
     let mut frames_sent: u64 = 0;
-    let mut send_volume_unlock = |file: &mut File, seq: &mut u8, state: &[u8; 47]| {
+    let send_volume_unlock = |file: &mut File, seq: &mut u8, state: &[u8; 47]| {
         // Re-assert audio config FROM CURRENT TRACKED STATE — motor bytes
         // ride along so constant rumble survives the periodic re-assert
         // (a bare volume_report zeroes them and kills steady rumble ~2.7 s
@@ -697,17 +856,37 @@ fn writer_thread(
         let rpt = crate::audio::state_report(*seq, &st);
         file.write_all(&rpt).is_ok()
     };
+    // L2CAP audio-start handshake (v28, vdsd parity): a mic-state 0x31 then
+    // a mic-open 0x32 — both prefixed — before the first (or re-primed)
+    // stream. The 0x31 uses the SHARED sequence; the 0x32 its own family.
+    let send_l2cap_handshake = |file: &mut File, seq: &mut u8, mic_seq: &mut u8| -> bool {
+        let s31 = crate::audio::state_report(*seq, &crate::l2cap::MIC_STATE);
+        *seq = (*seq + 1) & 0x0F;
+        let s32 = crate::audio::mic_report_032(*mic_seq, true);
+        *mic_seq = (*mic_seq + 1) & 0x0F;
+        let mut ok = file.write_all(&[0xA2]).is_ok();
+        ok = ok && file.write_all(&s31).is_ok();
+        ok = ok && file.write_all(&[0xA2]).is_ok();
+        ok = ok && file.write_all(&s32).is_ok();
+        ok
+    };
 
     // Unlock audio immediately (before the first combined report).
-    if !send_volume_unlock(file, &mut seq, &state) {
+    if l2cap {
+        if !send_l2cap_handshake(file, &mut seq, &mut mic_seq) {
+            return;
+        }
+    } else if !send_volume_unlock(file, &mut seq, &state) {
         return;
     }
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        if frames_sent > 0 && frames_sent % 256 == 0 {
-            // Re-assert the unlock periodically (~2.7 s).
+        // Periodic volume unlock (~2.7 s) is 0x35-hidraw-path only; vds sends
+        // the L2CAP mic handshake solely at stream start / re-prime, so the
+        // L2CAP path sends nothing extra here.
+        if !l2cap && frames_sent > 0 && frames_sent % 256 == 0 {
             if !send_volume_unlock(file, &mut seq, &state) {
                 break;
             }
@@ -716,13 +895,24 @@ fn writer_thread(
         // streaming (vds-style — no interleaved 0x31s on the interrupt
         // channel), relayed directly while idle.
         if !flush_kernel_outputs(
-            file, shared, &mut seq, &mut state, hp_volume, output, primed, combined,
+            file,
+            shared,
+            &mut seq,
+            &mut state,
+            &mut state63,
+            &mut last_state47,
+            hp_volume,
+            output,
+            force_speaker,
+            primed,
+            combined,
+            l2cap,
         ) {
             break;
         }
         // Gather input until one output frame can be produced.
         loop {
-            let need_samples = (in_pos + (FRAME_SAMPLES as f64) * 16.0 / 15.0).ceil() as usize + 2;
+            let need_samples = (in_pos + (FRAME_SAMPLES as f64) * ratio).ceil() as usize + 2;
             if in_buf.len() / 4 >= need_samples {
                 break;
             }
@@ -744,16 +934,38 @@ fn writer_thread(
                 ring.len() as i64
             };
             if fill == 0 {
-                // no real audio — send nothing; pad buffer drains meanwhile
+                // no real audio — send nothing; pad buffer drains meanwhile.
+                // MUST sleep: `continue` skips the pacing sleep at the loop
+                // bottom, and without this the idle writer hot-spins, choking
+                // the out_q mutex the rumble relay contends on.
                 starved_frames = 0;
                 next = Instant::now() + Duration::from_millis(20);
+                thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            // vds parity: prime only on non-silent audio (see silence
+            // gate below) — priming on PipeWire's idle-silence frames
+            // would flood the pad with silent 0x36s and wreck its input
+            // cadence.
+            let peak = in_buf.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+            if l2cap && peak < silence_eps {
+                in_buf.clear();
+                in_pos = 0.0;
+                next = Instant::now() + Duration::from_millis(20);
+                thread::sleep(Duration::from_millis(20));
                 continue;
             }
             primed = true;
             starved_frames = 0;
             eprintln!("sink: primed (ring fill {fill})");
+            // L2CAP re-prime: re-send mic-state + mic-open handshake (v28, same
+            // sequence as the start-of-stream handshake). The pad may have
+            // dropped the previous handshakes after draining its buffer.
+            if l2cap && !send_l2cap_handshake(file, &mut seq, &mut mic_seq) {
+                break;
+            }
         }
-        let need_samples = (in_pos + (FRAME_SAMPLES as f64) * 16.0 / 15.0).ceil() as usize + 2;
+        let need_samples = (in_pos + (FRAME_SAMPLES as f64) * ratio).ceil() as usize + 2;
         if in_buf.len() / 4 < need_samples {
             // underrun: pad with silence, keep the clock running
             starved_frames += 1;
@@ -772,6 +984,32 @@ fn writer_thread(
         } else {
             starved_frames = 0;
         }
+        // Silence gate (vds parity): skip the whole window when nothing
+        // real is in it — no 0x36 leaves the host during quiet/idle audio,
+        // which keeps the pad's input-report cadence clean (the pad bursts
+        // its 0x31s between constant 0x36s, and games reject that).
+        if l2cap && in_buf.iter().all(|s| s.abs() < silence_eps) {
+            in_buf.clear();
+            in_pos = 0.0;
+            starved_frames = 0;
+            silent_windows += 1;
+            if silent_windows >= 30 {
+                // ~320 ms of quiet: go idle — kernel outputs fall back to
+                // plain 0x31s until real audio re-primes the stream.
+                primed = false;
+                silent_windows = 0;
+                eprintln!("sink: idle (input silent — letting pad buffer drain)");
+            }
+            next += Duration::from_nanos(interval_ns);
+            let now = Instant::now();
+            if next > now {
+                thread::sleep(next - now);
+            } else if now.duration_since(next) > Duration::from_millis(200) {
+                next = now;
+            }
+            continue;
+        }
+        silent_windows = 0;
 
         // Produce 480 resampled stereo samples (speaker path, ch0/1).
         for s in 0..FRAME_SAMPLES {
@@ -783,7 +1021,7 @@ fn writer_thread(
             let r1 = in_buf[i0 * 4 + 5];
             pcm[s * 2] = (lerp(l0, l1, frac).clamp(-1.0, 1.0) * 32767.0) as i16;
             pcm[s * 2 + 1] = (lerp(r0, r1, frac).clamp(-1.0, 1.0) * 32767.0) as i16;
-            in_pos += 16.0 / 15.0;
+            in_pos += ratio;
         }
         let consumed_pairs = in_pos.floor() as usize;
 
@@ -811,65 +1049,92 @@ fn writer_thread(
         in_buf.drain(..consumed_pairs * 4);
         in_pos -= consumed_pairs as f64;
 
-        let mut frame = [0u8; 512];
-        for s in pcm.iter() {
-            peak_store(&PEAK_PCM, *s as f32 / 32768.0);
-        }
-        let n = unsafe {
-            opus_encode(
-                enc.0,
-                pcm.as_ptr(),
-                FRAME_SAMPLES as libc::c_int,
-                frame.as_mut_ptr(),
-                512,
-            )
-        };
-        if n <= 0 {
-            eprintln!("sink: opus_encode failed ({n})");
-            continue;
-        }
-        if n as usize != bytes_per_frame {
-            // CBR must give a constant size; anything else means the pad will
-            // misdecode. Log loudly, drop the frame (keep the cadence).
-            eprintln!(
-                "sink: encoder returned {n}B, expected {bytes_per_frame}B (CBR off?) — frame dropped"
-            );
-            continue;
-        }
-        // EXPERIMENT(jack TLV): the 0x93 speaker TLV has never been audible on
-        // this pad — every audible test (Phase-1 tone, Phase-2 music) used the
-        // 0x96 jack TLV and the pad played it through the built-in speaker.
-        // Force jack TLV + jack path until the speaker TLV is understood.
-        let jack = true;
-        let _ = force_speaker;
-        if jack != was_jack {
-            eprintln!(
-                "sink: routing → {}",
-                if jack { "headset jack" } else { "speaker" }
-            );
-            was_jack = jack;
-        }
-        // Re-assert audio state incl. path-select for this frame's routing.
-        merge_audio_state(&mut state, hp_volume, output, jack);
-        let ok = if combined {
-            let report = audio_report_0x36(seq, counter, &state, &hap, &frame[..n as usize], jack);
-            counter = counter.wrapping_add(1);
-            file.write_all(&report).is_ok()
-        } else {
-            let mut f200 = [0u8; 200];
-            f200.copy_from_slice(&frame[..n as usize]);
-            let report = match report_id {
-                0x39 => crate::audio::audio_report_0x39(seq, counter, &f200, jack),
-                _ => crate::audio::audio_report(seq, counter, &f200, jack),
-            };
+        // Haptics-only: no Opus TLV, no audio path selection — just the
+        // 0x12 PCM frame in a minimal 0x32 report.
+        let ok = if haptics_only {
+            let report = crate::audio::haptics_report_0x32(seq, counter, &hap);
             counter = counter.wrapping_add(2);
-            file.write_all(&report).is_ok()
+            wdump(file, &report)
+        } else {
+            let mut frame = [0u8; 512];
+            for s in pcm.iter() {
+                peak_store(&PEAK_PCM, *s as f32 / 32768.0);
+            }
+            let Some(enc_ref) = enc.as_ref() else {
+                break;
+            };
+            let n = unsafe {
+                opus_encode(
+                    enc_ref.0,
+                    pcm.as_ptr(),
+                    FRAME_SAMPLES as libc::c_int,
+                    frame.as_mut_ptr(),
+                    512,
+                )
+            };
+            if n <= 0 {
+                eprintln!("sink: opus_encode failed ({n})");
+                continue;
+            }
+            if n as usize != bytes_per_frame {
+                // CBR must give a constant size; anything else means the pad will
+                // misdecode. Log loudly, drop the frame (keep the cadence).
+                eprintln!(
+                    "sink: encoder returned {n}B, expected {bytes_per_frame}B (CBR off?) — frame dropped"
+                );
+                continue;
+            }
+            // Routing follows config: speaker=true → 0x93 TLV + 0x30 path
+            // (internal speaker); absent/false → 0x96 TLV + jack path.
+            let jack = !force_speaker;
+            if jack != was_jack {
+                eprintln!(
+                    "sink: routing → {}",
+                    if jack { "headset jack" } else { "speaker" }
+                );
+                was_jack = jack;
+            }
+            // Re-assert audio state incl. path-select for this frame's routing.
+            if l2cap {
+                sink_merge63(&mut state63, hp_volume, output, jack);
+                let mut f200 = [0u8; 200];
+                f200[..n as usize].copy_from_slice(&frame[..n as usize]);
+                let report =
+                    crate::audio::audio_report_036_bt(seq, counter, &state63, &hap, &f200, jack);
+                counter = counter.wrapping_add(1);
+                // Wire = HIDP prefix 0xA2 + raw report.
+                let mut wire = Vec::with_capacity(report.len() + 1);
+                wire.push(0xA2);
+                wire.extend_from_slice(&report);
+                wdump(file, &wire)
+            } else {
+                merge_audio_state(&mut state, hp_volume, output, jack);
+                if combined {
+                    let report =
+                        audio_report_0x36(seq, counter, &state, &hap, &frame[..n as usize], jack);
+                    counter = counter.wrapping_add(1);
+                    wdump(file, &report)
+                } else {
+                    let mut f200 = [0u8; 200];
+                    f200.copy_from_slice(&frame[..n as usize]);
+                    let report = match report_id {
+                        0x39 => crate::audio::audio_report_0x39(seq, counter, &f200, jack),
+                        _ => crate::audio::audio_report(seq, counter, &f200, jack),
+                    };
+                    counter = counter.wrapping_add(2);
+                    wdump(file, &report)
+                }
+            }
         };
         if !ok {
             eprintln!("sink: write failed — pad gone?");
             break;
         }
         seq = (seq + 1) & 0x0F;
+        if l2cap {
+            // this 0x36 delivered the tracked state — update the mirror
+            last_state47.copy_from_slice(&state63[..47]);
+        }
 
         // Pace: configurable interval (default 10667 µs), gently steered by
         // ring fill. Low gain: the spec's sweep shows ±tens of µs matters,
@@ -881,6 +1146,10 @@ fn writer_thread(
         stat_fill_min = stat_fill_min.min(fill);
         stat_fill_max = stat_fill_max.max(fill);
         let err = fill - TARGET_FILL_FRAMES;
+        // Gentle steering on every transport: keeps the metronom glued to
+        // the PipeWire production clock (fill error → ±tens of µs), which
+        // also absorbs scheduler jitter. Flat pacing accumulates any
+        // production/consumption mismatch until the pad drops frames.
         let adj = (interval_ns as i64 - err * 3_000).max(9_000_000);
         next += Duration::from_nanos(adj as u64);
         let now = Instant::now();

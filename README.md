@@ -1,168 +1,152 @@
 # mdrv-ds — Linux DualSense driver
 
-PipeWire-based Bluetooth audio sink, haptic relay, input remapper, and
-chord engine for the Sony DualSense (PS5) controller on Linux.
+Bluetooth (L2CAP) DualSense proxy for Linux: input passthrough, adaptive
+triggers, rumble, speaker/jack audio, and — with the bundled game/Wine
+patches — **full audio-based haptic feedback over Bluetooth**, including in
+games that officially restrict haptics to USB (FF16, Stellar Blade).
 
 ## What it does
 
-| Feature                                                     | Status                                                  |
-| ----------------------------------------------------------- | ------------------------------------------------------- |
-| **Bluetooth audio sink** (Opus over HID output reports)     | Partial — audio plays but ~1 s stutter persists         |
-| **Haptic feedback relay** (kernel FF → BT 0x31 reports)     | Working — rumble reaches pad, micro-stutters at ~100 ms |
-| **Input remapping** (evdev → uinput, with PS-button chords) | Working                                                 |
-| **Touchpad-as-mouse**                                       | Working                                                 |
-| **USB passthrough** (uhid virtual device)                   | Working                                                 |
-| **Audio via 3.5 mm jack**                                   | Confirmed audible, but same ~1 s stutter                |
+| Feature                                                       | Status  |
+| ------------------------------------------------------------- | ------- |
+| Bluetooth proxy (self-owned L2CAP HID channels)               | Working |
+| Input over BT (BT-native virtual pad, raw report passthrough) | Working |
+| Adaptive triggers + rumble over BT                            | Working |
+| Speaker / 3.5 mm jack audio over BT                           | Working |
+| Audio-based haptics over BT (games: FF16, Stellar Blade)      | Working |
+| USB cable takeover (cabled pad switches to hidraw relay)      | Working |
+| Touchpad-as-mouse, PS-button chords, input gating             | Working |
 
 ## Architecture
 
 ```
-┌────────────┐     ┌────────────┐     ┌──────────┐     ┌─────────┐
-│ PipeWire   │────▶│ mdrv-ds    │────▶│ Opus     │────▶│ hidraw  │──▶ BT
-│ (source)   │     │ ring buf   │     │ encoder  │     │ 0x35/39 │
-└────────────┘     └────────────┘     └──────────┘     └─────────┘
-                         ▲                                    │
-                         │          ┌────────────┐            │
-                         └──────────│ kernel FF  │◀───────────┘
-                                    │ (evdev)    │
-                                    └────────────┘
+real pad ──BT L2CAP(0x11 ctrl /0x13 intr)──▶ mdrv-ds proxy ──IPC──▶ holder ──uhid──▶ virtual pad
+                ▲  │                        │   ▲                (owns /dev/uhid,
+     features/  │  └── 0x31/0x36 outputs    │   └─ feature GET/     survives restarts)
+     SET fwd    │                           │      SET serving
+                │                           ▼
+Wine/games ◀── kernel evdev/hidraw ◀── PipeWire capture ◀── sink writer thread
+                                            (F32 48k quad)   │ Opus CBR 160k
+                                                             ▼
+                                             0x36 combined reports ─▶ pad
+                                             (state + haptics s8 +
+                                              speaker/jack Opus)
 ```
 
-**Pipeline**: PipeWire delivers 48 kHz f32 quad (FL/FR/RL/RR) audio to a
-custom sink. The sink resamples to 45 kHz mono/stereo i16, encodes with
-libopus (CBR 160 kbps), frames into HID output reports (0x35 or 0x39),
-and writes to `/dev/hidrawN` at the pad's polling interval (~93 Hz).
+- **L2CAP session** (`src/l2cap.rs`): mdrv-ds binds PSM 0x11/0x13 itself
+  (`bluetoothd --noplugin=input`, see `scripts/bt-input-off.sh`), fetches
+  feature reports 0x09/0x20/0x05, sends the vds-parity INIT 0x32, and keeps
+  the control channel open for the whole session (drained by the relay).
+- **Virtual pad**: UHID device presented bus=BLUETOOTH with the plain BT HID
+  descriptor (279 B). Raw BT input reports pass through untouched; the kernel
+  parses them exactly like a real BT pad. (A merged USB+BT descriptor was
+  tried and reverted — it broke natural per-transport classification in
+  Sony's libScePad; see `DS5_HID_REPORT_DESCRIPTOR_MERGED` in l2cap.rs.)
+  Feature GETs are served from the live cache (MAC rewritten to the virtual
+  address, kernel-convention CRCs).
+- **Sink** (`src/sink.rs`): captures the PipeWire stream on our impersonated
+  endpoint (F32 48k quad), gates silence, encodes speaker audio as Opus CBR,
+  packs RL/RR as s8 haptics into 398 B 0x36 reports, and overlays kernel
+  output state so rumble/triggers ride the same reports. Idle state falls
+  back to plain 0x31 relays (vds parity).
+- **Holder** (`src/holder.rs`): owns `/dev/uhid`; the virtual pad survives
+  proxy restarts and transport switches.
 
-**Haptic relay**: Kernel force-feedback effects are captured from evdev,
-translated to DualSense 0x31 state reports, and written to hidraw.
-They share the same ACL channel as audio.
+Reference implementation for the BT protocol: [vds](https://github.com/hhao14/vds).
 
 ## Files
 
-| File                 | Purpose                                                             |
-| -------------------- | ------------------------------------------------------------------- |
-| `src/sink.rs`        | PipeWire capture thread, ring buffer, writer thread, state tracking |
-| `src/audio.rs`       | Opus encoder init, 0x35/0x39 report builders, CRC                   |
-| `src/hid.rs`         | HID output report writer, reader, feature reports                   |
-| `src/proxy.rs`       | evdev → uinput input relay, chord engine, mouse emulation           |
-| `src/config.rs`      | Configuration deserialization                                       |
-| `src/main.rs`        | CLI, systemd integration, IPC server                                |
-| `config/config.toml` | Default configuration (copy to `~/.config/mdrv-ds/`)                |
-
-## Configuration
-
-Key `[audio]` options (in `~/.config/mdrv-ds/config.toml`):
-
-```toml
-[audio]
-output = true # enable BT audio sink
-bitrate = 160000 # Opus CBR bps
-# report = "0x35"   # HID report ID (0x35 default; 0x39 for 547B ladder)
-# interval_us = 10667  # writer pacing in µs (default 10667 ≈ 93.7 Hz)
-```
+| File                        | Purpose                                                         |
+| --------------------------- | --------------------------------------------------------------- |
+| `src/proxy.rs`              | Session loop, input/output/feature relay, chords, mouse, gating |
+| `src/l2cap.rs`              | L2CAP listeners/session, HID descriptors, feature cache         |
+| `src/sink.rs`               | PipeWire capture, ring buffer, 0x36 writer, kernel-output merge |
+| `src/audio.rs`              | Report builders (0x31/0x32/0x35/0x36), CRC                      |
+| `src/holder.rs`             | uhid daemon keeping the virtual pad alive                       |
+| `src/ipc.rs`                | proxy↔holder framing protocol                                   |
+| `src/uhid.rs`               | uhid event codec                                                |
+| `src/hid.rs`                | Pad discovery, feature lengths                                  |
+| `scripts/ds5-haptics-patch` | Idempotent binary patcher (games + GE-Proton), see below        |
+| `scripts/bt-input-off.sh`   | bluetoothd `--noplugin=input` override install                  |
 
 ## Build & run
 
 ```bash
-cargo build --release
-systemctl --user start mdrv-ds   # or: mdrv-ds proxy --daemon
+make release        # cargo build --release + setcap cap_net_bind_service,cap_net_raw
+systemctl --user restart mdrv-ds-holder.service mdrv-ds.service
 ```
 
-Requires: PipeWire dev libraries (`libpipewire-0.3-dev`), Rust ≥1.70.
+Requires: Rust, libpipewire, bluez with `bluetoothd --noplugin=input`
+(installed by `scripts/bt-input-off.sh`). Config in
+`~/.config/mdrv-ds/config.toml` (see `config/config.toml`).
 
-## Known issues
+## Game patches: DualSense audio-haptics over Bluetooth
 
-### 1. ~1-second audio stutter (BLOCKING)
+Windows games gate PS5 audio-haptics (the quad-channel F32/48k stream whose
+RL/RR channels carry haptic waveforms) on the controller looking like a USB
+DualSense. Over plain Bluetooth they never open that stream. mdrv-ds already
+delivers the audio path itself (L2CAP 0x36 reports to speaker + haptics
+actuators); the patches make the _games_ use it.
 
-**The primary open problem.** Audio plays through the pad's speaker (and
-3.5 mm jack when connected) but stutters with a ~1 s period.
+`scripts/ds5-haptics-patch` is idempotent, auto-backs up to
+`<target>.hapticsbak`, detects game updates via byte signatures, and supports
+`status` / `patch` / `restore`. Four profiles:
 
-**What we know:**
+```bash
+scripts/ds5-haptics-patch status              # everything
+scripts/ds5-haptics-patch patch ff16          # game: ffxvi.exe
+scripts/ds5-haptics-patch patch stellarblade  # game: libScePad.dll
+scripts/ds5-haptics-patch patch ge-winepulse ge-winebus  # GE-Proton libs
+```
 
-- Host-side stats are clean: 0 underruns, 0 overflows, ring fill stable at
-  3–5 frames. Peak instrumentation proves real audio flows from PipeWire
-  through the ring, resampler, and encoder (`peak in 0.900 pcm 0.400` with
-  a 440 Hz test tone).
-- The stutter persists across report IDs (0x35 vs 0x39), interval tuning
-  (10667 vs 10669 µs), and dual-frame batching attempts.
-- The Opus stream is spec-compliant: correct TLV framing, advancing seq,
-  counter, and CRC. The pad accepts the reports without error.
-- The host-side encoding pipeline is healthy — the problem is pad-side.
+- **ff16** — NOPs four conditional jumps guarding the audio engine's
+  endpoint-shopper Init (`0x141041135/48/59/7a`). The shopper normally only
+  re-runs when the WASAPI endpoint count changes after launch, which never
+  happens over BT; patched, it always runs and finds our sink
+  ("Speakers (DualSense Wireless Controller)") and opens the quad stream.
+- **stellarblade** — libScePad.dll: classification is left natural (the
+  BT-shaped pad classifies as Bluetooth, so reports parse correctly on BT and
+  as USB when cabled); the patch only NOPs the `bus == USB` check in
+  `scePadIsSupportedAudioFunction()` (`0x18000ae30`) so BT-classified pads
+  get haptics/speaker. pid validation is kept.
+- **ge-winepulse** — `get_container_id()` stubbed to return a constant
+  container GUID `{0CE6054C-0000-FFFF-C0FF-EE0CE6054C00}` for every endpoint
+  (virtual endpoints have no udev usb_device parent, so Wine derived
+  GUID_NULL and any container-ID matching fails).
+- **ge-winebus** — pad stamped with the same constant GUID every reconnect;
+  `BTHENUM` ancestry string → `USB` so games walking `CM_Get_Parent` see a
+  USB parent. Haptics were verified working _with all three GE patches
+  installed_; they were never isolated one-by-one — do not selectively revert
+  without retesting.
 
-**Hypotheses (not confirmed):**
-
-- **Pacing mismatch**: Our fixed 10667 µs interval doesn't match this
-  pad's crystal tolerance (dsneo measured ±200 ppm per unit). The pad's
-  internal audio renderer buffer over/underflows when the gap drifts.
-- **ACL contention**: The 478 Hz input report traffic (buttons, sticks,
-  gyro) shares the Bluetooth ACL channel with our 94 reports/s output.
-  Scheduling jitter causes burst-then-gap patterns at ~1 s.
-- **Pad-side audio renderer state**: After hours of experimental report
-  streams (VBR garbage, 0x36 floods, mask experiments), the renderer may
-  be wedged. A full power-cycle (hold PS ~10 s) may help but hasn't been
-  confirmed as a fix.
-
-**What hasn't worked:**
-
-- Switching between 0x35 and 0x39 report IDs
-- Interval tuning: 10667 → 10669 µs
-- Dual-frame 0x39 batching (ghost button presses; pad misread the layout)
-- Ring buffer sizing changes
-- VBR → CBR Opus (fixed a separate decoder bug, not this stutter)
-
-### 2. Rumble micro-stutter (~100 ms)
-
-Haptic feedback reaches the pad and is continuous ("finally continuous"
-per user testing) but exhibits micro-stutters at ~100 ms period. This is
-separate from the audio stutter. Likely related to the same ACL scheduling
-or pad-side renderer timing.
-
-### 3. DualSense audio renderer "wedging"
-
-After extended testing sessions with various experimental report formats
-(VBR, wrong masks, 0x36 floods), the pad's internal audio renderer may
-enter a state where it stops producing audible output even with
-spec-correct input. This is suspected but not confirmed — a full pad
-power-cycle (not just BT reconnect) has not been verified as a fix.
+Re-apply after game or GE-Proton updates (`status` shows MISMATCH when bytes
+change). Pristine backups also live in `~/.local/state/mdrv-ds/debug/`.
 
 ## Test infrastructure
 
 ```bash
-# Generate a quad-channel test tone (440 Hz FL/FR, 45 Hz RL/RR)
+# Quad-channel test tone (440 Hz FL/FR, 45 Hz RL/RR)
 python3 -c "
 import struct, math
-frames = 20*480
 out = bytearray()
-for i in range(frames):
+for i in range(20*480):
     t = i/48000
-    fl = fr = 0.4*math.sin(2*math.pi*440*t)
-    rl = rr = 0.9*math.sin(2*math.pi*45*t)
-    out += struct.pack('<4f', fl, fr, rl, rr)
+    out += struct.pack('<4f',
+        0.4*math.sin(2*math.pi*440*t), 0.4*math.sin(2*math.pi*440*t),
+        0.9*math.sin(2*math.pi*45*t),  0.9*math.sin(2*math.pi*45*t))
 open('/tmp/quad.f32','wb').write(bytes(out))
 "
-
-# Play through the BT sink
 pw-play --raw --format f32 --rate 48000 --channels 4 \
-  --channel-map FL,FR,RL,RR \
-  --target mdrv-ds.dualsense-bt \
-  /tmp/quad.f32
-```
-
-Peak instrumentation in the logs confirms audio health:
-
-```
-sink: stats fill 3 (min 2 max 4), underruns +0 (0 total),
-       overflows +0 (0 total), peak in 0.900 pcm 0.400
+  --channel-map FL,FR,RL,RR --target mdrv-ds.dualsense-bt /tmp/quad.f32
 ```
 
 ## References
 
-- [dsneo spec](https://github.com/forgerpl/dualsense-neo/blob/main/SPEC.md) —
+- [vds](https://github.com/hhao14/vds) — reference BT-protocol implementation
+- [dsneo SPEC](https://github.com/forgerpl/dualsense-neo/blob/main/SPEC.md) —
   DualSense HID protocol documentation
-- [DualSense BLE HID spec](https://controllers.fandom.com/wiki/Sony_DualSense) —
-  Input/output report formats
-- [vds (Virtual DualSense)](https://github.com/hhao14/vds) —
-  Reference implementation using direct L2CAP (proves audio is possible)
+- [DualSense wiki](https://controllers.fandom.com/wiki/Sony_DualSense) —
+  report formats, feature reports, BT rdesc
 
 ## License
 
