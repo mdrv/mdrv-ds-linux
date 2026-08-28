@@ -201,17 +201,17 @@ BG_WINDOW='
   fi
 '
 START_D() {
-  # env -u DISABLE_GAMESCOPE_WSI: the disable is the ff16/vkd3d present_wait
-  # hang fix and must stay for GAME children — but the suite's Vulkan
-  # (blade/gpui) clients present fine through the gamescope WSI layer, and
-  # without it they fall off the efficient path (launcher ran ~15 FPS on
-  # 2026-08-28). Passed daemons are started in the given order: gamescope
-  # wlserver stacks layer surfaces by MAP order (later = on top), so the
-  # launcher goes FIRST and the popup overlays map above it.
+  # Daemons are started in the given order: gamescope wlserver stacks layer
+  # surfaces by MAP order (later = on top), so the launcher goes FIRST and
+  # the popup overlays map above it. DISABLE_GAMESCOPE_WSI stays SET for
+  # the suite too: with the layer active, gpui/blade's swapchain recreate
+  # on first configure hits "wlserver: create_swapchain: Surface already
+  # had a gamescope_swapchain" and the surface never presents (black
+  # screen, 2026-08-28). The disabled path works, just slower (~15 FPS).
   echo "
   for d in $*; do
     echo \"[suite] starting mdrv-ds-\$d on gamescope-0\"
-    env -u DISABLE_GAMESCOPE_WSI /g/mdrv-ds-\$d/target/release/mdrv-ds-\$d daemon start --foreground >>\"\$GSLOG\" 2>&1 &
+    /g/mdrv-ds-\$d/target/release/mdrv-ds-\$d daemon start --foreground >>\"\$GSLOG\" 2>&1 &
   done"
 }
 LAUNCHER_BIN=/g/mdrv-ds-launcher/target/release/mdrv-ds-launcher
@@ -226,7 +226,7 @@ else
   # then the popups; the toggle-show comes last so the carousel is already
   # up when the user gets the screen.
   INNER="$WAIT_SOCKET$BG_WINDOW"'
-  env -u DISABLE_GAMESCOPE_WSI '"$LAUNCHER_BIN"' daemon start --foreground >>"$GSLOG" 2>&1 &
+  '"$LAUNCHER_BIN"' daemon start --foreground >>"$GSLOG" 2>&1 &
   LPID=$!
   for _ in $(seq 100); do
     [ -S "$XDG_RUNTIME_DIR/mdrv-ds-launcher.sock" ] && break
