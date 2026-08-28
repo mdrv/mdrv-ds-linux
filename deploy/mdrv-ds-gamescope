@@ -237,8 +237,10 @@ else
   # Launcher runs as a normal X11 (XWayland) window: show = activate,
   # hide = minimize. Popups map as layer surfaces afterwards; the toggle
   # comes last so the carousel is already raised when the user gets the
-  # screen.
-  INNER="$WAIT_SOCKET$BG_WINDOW"'
+  # screen. NO background window here: gamescope scales ANY toplevel to
+  # fill the screen and gives it focus — an mpv bg would steal the
+  # primary slot from the launcher itself (2026-08-28 session).
+  INNER="$WAIT_SOCKET"'
   env -u WAYLAND_DISPLAY DISPLAY=:0 '"$LAUNCHER_BIN"' daemon start --foreground >>"$GSLOG" 2>&1 &
   LPID=$!
   for _ in $(seq 100); do
