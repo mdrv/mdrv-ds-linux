@@ -87,6 +87,7 @@ cleanup() {
   [ -n "${GS:-}" ] && kill "$GS" 2>/dev/null
   [ -n "${GS:-}" ] && wait "$GS" 2>/dev/null
   suite_pkill
+  pkill -f 'lavfi:color=blac[k]' 2>/dev/null # bg window (mpv); bracket avoids self-match
   if pgrep -x hyprland >/dev/null 2>&1; then
     log "Hyprland alive; restoring suite services"
     systemctl --user start "${SERVICES[@]}" 2>/dev/null || log "WARN: restart rc=$?"
@@ -178,28 +179,54 @@ WAIT_SOCKET='
   export WAYLAND_DISPLAY=gamescope-0
   # Compositor readiness: the socket existing does NOT mean the scene is
   # live yet — daemons started at socket-time got their layer surfaces
-  # mapped but never composited (black screen) in the 2026-08-28 session.
-  # Give gamescope time to finish output setup before any client connects.
+  # mapped but never composited in the 2026-08-28 session. Give gamescope
+  # time to finish output setup before any client connects.
   sleep 2
   echo "[suite] gamescope-0 up $(date +%H:%M:%S); starting suite daemons"
 '
+# gamescope (drm backend) never performs its first page-flip until a real
+# window (xdg toplevel) presents a frame — layer-shell overlays alone leave
+# the CRTC scanning out the frozen console text (2026-08-28 session: suite
+# + visible launcher, yet the tty stayed frozen until a plain mpv window
+# connected and everything appeared at once). A black fullscreen mpv is the
+# persistent "live window" that flips scanout over to the compositor; the
+# suite overlays composite on top of it.
+BG_WINDOW='
+  if command -v mpv >/dev/null 2>&1; then
+    mpv --fs --no-audio --really-quiet --force-window=yes --loop=inf \
+      av://lavfi:color=black >>"$GSLOG" 2>&1 &
+    echo "[suite] background window started (black mpv, pid $!)"
+  else
+    echo "[suite] WARN: mpv not found — the screen may stay on console text until a game window appears" >&2
+  fi
+'
 START_D() {
+  # env -u DISABLE_GAMESCOPE_WSI: the disable is the ff16/vkd3d present_wait
+  # hang fix and must stay for GAME children — but the suite's Vulkan
+  # (blade/gpui) clients present fine through the gamescope WSI layer, and
+  # without it they fall off the efficient path (launcher ran ~15 FPS on
+  # 2026-08-28). Passed daemons are started in the given order: gamescope
+  # wlserver stacks layer surfaces by MAP order (later = on top), so the
+  # launcher goes FIRST and the popup overlays map above it.
   echo "
   for d in $*; do
     echo \"[suite] starting mdrv-ds-\$d on gamescope-0\"
-    /g/mdrv-ds-\$d/target/release/mdrv-ds-\$d daemon start --foreground >>\"\$GSLOG\" 2>&1 &
+    env -u DISABLE_GAMESCOPE_WSI /g/mdrv-ds-\$d/target/release/mdrv-ds-\$d daemon start --foreground >>\"\$GSLOG\" 2>&1 &
   done"
 }
 LAUNCHER_BIN=/g/mdrv-ds-launcher/target/release/mdrv-ds-launcher
 
 if [ "${1:-}" = "--" ]; then shift; fi
 if [ $# -gt 0 ]; then
-  INNER="$WAIT_SOCKET$(START_D audio settings launcher notify)"'
+  INNER="$WAIT_SOCKET$BG_WINDOW$(START_D launcher audio settings notify)"'
   exec "$@"'
   ROOT="$*"
 else
-  INNER="$WAIT_SOCKET$(START_D audio settings notify)"'
-  '"$LAUNCHER_BIN"' daemon start --foreground >>"$GSLOG" 2>&1 &
+  # Launcher maps first (bottom of the layer stack — see START_D note),
+  # then the popups; the toggle-show comes last so the carousel is already
+  # up when the user gets the screen.
+  INNER="$WAIT_SOCKET$BG_WINDOW"'
+  env -u DISABLE_GAMESCOPE_WSI '"$LAUNCHER_BIN"' daemon start --foreground >>"$GSLOG" 2>&1 &
   LPID=$!
   for _ in $(seq 100); do
     [ -S "$XDG_RUNTIME_DIR/mdrv-ds-launcher.sock" ] && break
@@ -210,7 +237,7 @@ else
     '"$LAUNCHER_BIN"' toggle || echo "[suite] WARN: launcher toggle rc=$?"
   else
     echo "[suite] WARN: launcher socket never appeared (overlay stays hidden)" >&2
-  fi
+  fi'"$(START_D audio settings notify)"'
   wait $LPID'
   ROOT="mdrv-ds-launcher (auto-shown)"
 fi
