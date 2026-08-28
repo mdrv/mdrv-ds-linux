@@ -151,3 +151,62 @@ pw-play --raw --format f32 --rate 48000 --channels 4 \
 ## License
 
 TBD.
+
+## Manual test guide
+
+Expected behaviors, verified end-to-end. Deploy first:
+
+```bash
+make release   # or: cargo build --release &&
+sudo setcap cap_net_bind_service,cap_sys_ptrace+ep target/release/mdrv-ds
+systemctl --user restart mdrv-ds.service   # pad needs a PS press to reconnect
+```
+
+Debug helpers: `MDRV_DUMP_INPUT=<file>` (raw BT input frames),
+`MDRV_DS_DEBUG=1`; journals: `journalctl --user -u mdrv-ds.service`.
+
+### Connection & input
+
+1. Press PS on the pad → connects via the proxy (journal: session + INIT);
+   the virtual pad appears (`/dev/input` "Wireless Controller", BT bus).
+   Games/`evtest` see full input: buttons, sticks, touchpad, adaptive
+   triggers, rumble.
+2. Restart `mdrv-ds.service` mid-session → virtual pad SURVIVES (holder owns
+   uhid); press PS to re-link the pad; input continues seamlessly.
+3. Plug a USB cable → the pad is taken over via hidraw relay (no BT
+   session); unplug → BT resumes on PS press.
+
+### Audio & jack routing
+
+4. Play anything into the `mdrv-ds.dualsense-bt` sink (it is the default) →
+   audio from the pad's speaker; mdrv-ds journal shows `primed`.
+5. **Plug a headset into the 3.5 mm jack** → within ~1 s audio moves to the
+   headset, the speaker goes SILENT, journal logs `jack engage → headset`,
+   and a "Headset connected" toast fires.
+6. Flutter immunity: with the headset plugged, audio must stay on the jack
+   indefinitely (the HP-detect bit flutters at ~10 Hz; the integrator
+   debouncer — +1/high, −4/low, arm at 16, disarm after 800 ms with zero
+   highs — must never flip routing on noise).
+7. **Unplug** → after ≤1 s audio returns to the speaker and STAYS there
+   (spurious one-off high readings after unplug must not re-engage the
+   headset; the 800 ms zero-high disarm holds). "Headset disconnected"
+   toast fires.
+8. Haptics: in a patched game (FF16/Stellar Blade), effects ride audio —
+   triggers/rumble work over BT while music plays (see game patches below).
+
+### Housekeeping
+
+9. Idle keep-alive: leave the pad idle (no audio) for 10+ min → the pad must
+   NOT power off (writer sends a zero-flag 0x31 every 2 s).
+10. `mdrv-ds mouse on|off|toggle|status`: on = touchpad moves the desktop
+    cursor (no holder); off = holder grabs the virtual pad (games get raw
+    touchpad). `status` agrees with the settings overlay row.
+11. Chords from `config.toml` (e.g. PS+R2 → audio overlay toggle) fire the
+    bound command exactly once per press.
+
+### Known-good notes
+
+- USB DualSense does NOT appear in pavucontrol as an audio device — audio
+  is L2CAP-only by design (USB isochronous audio unimplemented).
+- `setcap` needs BOTH capabilities above after every rebuild; a missing
+  `cap_sys_ptrace` shows up as EACCES binding PSM 0x11/0x13.
