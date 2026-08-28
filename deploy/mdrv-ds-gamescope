@@ -1,0 +1,226 @@
+#!/bin/bash
+# mdrv-ds-gamescope — the full mdrv-ds suite inside a gamescope DRM session.
+# Run from a BARE TEXT VT (no active graphical session on this VT).
+#
+#   mdrv-ds-gamescope                     session root = mdrv-ds-launcher
+#                                         (launch games from the pad)
+#   mdrv-ds-gamescope -- <cmd> [args…]    session root = <cmd> (e.g. a game
+#                                         via heroic; suite still comes up)
+#
+# What you should see at startup:
+#   * launcher mode — the launcher carousel appears as soon as the daemon
+#     is up (the script auto-toggles it once). Before this existed the
+#     launcher started hidden and gamescope showed a BLACK screen — which
+#     is indistinguishable from a hang. PS toggles it back after hiding.
+#   * command mode — the game; suite overlays stay hidden (PS opens them).
+#
+# What runs where:
+#   * mdrv-ds proxy/holder stay untouched (compositor-independent).
+#   * The four Wayland-bound daemons (audio, settings, launcher, notify)
+#     are stopped as systemd units and restarted INSIDE the session on
+#     WAYLAND_DISPLAY=gamescope-0 (layer-shell overlays + toasts).
+#   * On exit the systemd units are restored only while Hyprland is alive
+#     (they would crash-loop against a missing wayland-1 otherwise).
+#
+# Ending the session: exit the game (command mode); Ctrl-Q on a visible
+# launcher overlay (root-child exit ends the session); or from ANOTHER tty
+# `pkill -f mdrv-ds-gamescope` / kill the gamescope pid — the script traps
+# INT/TERM/HUP, tears everything down and re-initialises this VT.
+#
+# NOTE on the console keyboard: while gamescope owns this VT it is in
+# graphics mode and gamescope consumes the input — Ctrl-C HERE does
+# nothing. That is expected; kill from another tty or use Ctrl-Q.
+#
+# NVIDIA + gamescope WSI + VK_KHR_present_wait hang: fixed per-game via
+# DISABLE_GAMESCOPE_WSI=1 in Heroic GamesConfig enviromentOptions (applies
+# both to heroic-launched and mdrv-ds-launcher-launched games).
+#
+# Trace:   ${MDRV_GS_LOG:-~/.local/state/mdrv-ds/gamescope.log}
+# Session: ${MDRV_GS_GAMELOG:-~/.local/state/mdrv-ds/gamescope.gamescope.log}
+# (persistent across reboots — /tmp loses everything on a forced restart)
+set -u
+STATE_DIR=$HOME/.local/state/mdrv-ds
+LOG=${MDRV_GS_LOG:-$STATE_DIR/gamescope.log}
+GSLOG=${MDRV_GS_GAMELOG:-$STATE_DIR/gamescope.gamescope.log}
+mkdir -p "$STATE_DIR"
+log() { printf '%(%H:%M:%S)T %s\n' -1 "$*" | tee -a "$LOG"; }
+
+SERVICES=(mdrv-ds-audio.service mdrv-ds-settings.service
+  mdrv-ds-launcher.service mdrv-ds-notify.service)
+
+# Kill transient suite instances + clear their toggle sockets. Pattern is
+# exact enough to never match the mdrv-ds proxy/holder ("…/mdrv-ds holder").
+suite_pkill() {
+  pkill -f '/target/release/mdrv-ds-(audio|settings|launcher|notify)' 2>/dev/null
+  for n in audio settings launcher notify; do
+    rm -f "$XDG_RUNTIME_DIR/mdrv-ds-$n.sock"
+  done
+}
+
+# Kernel console gamescope leaves behind can stay in graphics mode after a
+# teardown crash (frozen tty, keyboard dead). A VT switch away+back makes
+# the kernel re-initialise the console — best effort, needs sudo.
+vt_reinit() {
+  local active orig safe
+  active=$(cat /sys/class/tty/tty0/active 2>/dev/null) || return 0
+  case ${active##*/} in
+    tty[0-9]*) orig=${active##*/tty} ;;
+    *) return 0 ;;
+  esac
+  [ "$orig" -ge 1 ] 2>/dev/null || return 0
+  safe=$(( orig == 2 ? 3 : 2 ))
+  if sudo -n chvt "$safe" 2>/dev/null; then
+    sleep 0.4
+    sudo -n chvt "$orig" 2>/dev/null || true
+    log "vt reinit: switched $orig -> $safe -> $orig"
+  else
+    log "vt reinit: sudo chvt unavailable (console may stay frozen; Ctrl-Alt-F<n> still switches)"
+  fi
+}
+
+CLEANED=0
+cleanup() {
+  [ "$CLEANED" = 1 ] && return 0
+  CLEANED=1
+  local sig=$1
+  log "cleanup ($sig): stopping gamescope + suite"
+  [ -n "${GS:-}" ] && kill "$GS" 2>/dev/null
+  [ -n "${GS:-}" ] && wait "$GS" 2>/dev/null
+  suite_pkill
+  if pgrep -x hyprland >/dev/null 2>&1; then
+    log "Hyprland alive; restoring suite services"
+    systemctl --user start "${SERVICES[@]}" 2>/dev/null || log "WARN: restart rc=$?"
+  else
+    log "no Hyprland running; leaving suite services stopped (they need wayland-1)"
+  fi
+  vt_reinit
+  log "=== mdrv-ds-gamescope done ==="
+}
+trap 'cleanup INT'  INT
+trap 'cleanup TERM' TERM
+trap 'cleanup HUP'  HUP
+
+log "=== mdrv-ds-gamescope start (pid $$, tty=$(tty 2>/dev/null || echo none), WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-}, DISPLAY=${DISPLAY:-}) ==="
+
+if [ -n "${WAYLAND_DISPLAY:-}" ] || [ -n "${DISPLAY:-}" ]; then
+  log "ERROR: run from inside a graphical session (WAYLAND_DISPLAY/DISPLAY set)."
+  log "  --backend=drm needs DRM master: run from a bare text VT instead."
+  printf 'mdrv-ds-gamescope: refuse to start inside a graphical session (drm backend needs a free VT). See %s\n' "$LOG" >&2
+  exit 1
+fi
+if pgrep -x hyprland >/dev/null 2>&1; then
+  log "note: Hyprland is running on another tty — fine, but gamescope waits"
+  log "      until ITS vt is active: switch to this tty and it takes over."
+fi
+
+# Fail fast: the NVIDIA env below forces gamescope's compositor onto the
+# NVIDIA GPU. If no monitor is attached to any NVIDIA card, scanout falls
+# to another GPU and every page flip fails (drmModeAddFB2WithModifiers
+# EINVAL) — a black screen indistinguishable from a hang. Refuse early,
+# before any service is touched.
+nvidia_card_has_monitor() {
+  local card conn
+  for card in /sys/class/drm/card[0-9]; do
+    [ -r "$card/device/vendor" ] || continue
+    [ "$(cat "$card/device/vendor")" = "0x10de" ] || continue
+    for conn in "$card"-*; do
+      [ -r "$conn/status" ] || continue
+      if [ "$(cat "$conn/status")" = "connected" ]; then
+        echo "monitor on ${conn##*/} (NVIDIA)"
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+if grep -q '^nvidia ' /proc/modules 2>/dev/null; then
+  if mon=$(nvidia_card_has_monitor); then
+    log "nvidia loaded; $mon — compositor+scanout both NVIDIA, ok"
+  else
+    log "ERROR: nvidia module loaded but NO monitor is attached to any NVIDIA card."
+    log "  The NVIDIA env would force gamescope to composite on NVIDIA while"
+    log "  another GPU scans out → drmModeAddFB2 EINVAL → black screen."
+    log "  Fix: plug the monitor into the eGPU first."
+    printf 'mdrv-ds-gamescope: nvidia detected but no monitor on the NVIDIA card — refusing (black-screen guard). See %s\n' "$LOG" >&2
+    exit 1
+  fi
+fi
+
+log "stopping Wayland-bound suite services: ${SERVICES[*]}"
+systemctl --user stop "${SERVICES[@]}" || log "WARN: systemctl stop rc=$?"
+suite_pkill # transients would squat the toggle sockets
+
+# Render/game environment for the whole session (gamescope + children).
+if grep -q '^nvidia ' /proc/modules 2>/dev/null; then
+	export __GLX_VENDOR_LIBRARY_NAME=nvidia
+	export VK_LAYER_NV_optimus=NVIDIA_only
+	export PROTON_ENABLE_NVAPI=1 PROTON_ENABLE_NGX_UPDATER=1
+	export DXVK_FILTER_DEVICE_NAME="NVIDIA GeForce RTX 5060 Ti"
+	export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json
+fi
+export DISABLE_GAMESCOPE_WSI=1
+
+# Session child: wait for the gamescope wayland socket, bring the suite
+# daemons up on it, then run the session root. In command mode all four
+# daemons start in the background and the game is the root; in launcher
+# mode the launcher daemon is the root — started bg, auto-toggled visible
+# (otherwise gamescope shows a black screen: the daemon starts hidden),
+# then waited on so its exit ends the session.
+WAIT_SOCKET='
+  for _ in $(seq 100); do
+    [ -S "$XDG_RUNTIME_DIR/gamescope-0" ] && break
+    sleep 0.1
+  done
+  if [ ! -S "$XDG_RUNTIME_DIR/gamescope-0" ]; then
+    echo "[suite] gamescope-0 socket never appeared; session child exiting" >&2
+    exit 1
+  fi
+  export WAYLAND_DISPLAY=gamescope-0
+  echo "[suite] gamescope-0 up $(date +%H:%M:%S); starting suite daemons"
+'
+START_D() {
+  echo "
+  for d in $*; do
+    echo \"[suite] starting mdrv-ds-\$d on gamescope-0\"
+    /g/mdrv-ds-\$d/target/release/mdrv-ds-\$d daemon start --foreground >>\"\$GSLOG\" 2>&1 &
+  done"
+}
+LAUNCHER_BIN=/g/mdrv-ds-launcher/target/release/mdrv-ds-launcher
+
+if [ "${1:-}" = "--" ]; then shift; fi
+if [ $# -gt 0 ]; then
+  INNER="$WAIT_SOCKET$(START_D audio settings launcher notify)"'
+  exec "$@"'
+  ROOT="$*"
+else
+  INNER="$WAIT_SOCKET$(START_D audio settings notify)"'
+  '"$LAUNCHER_BIN"' daemon start --foreground >>"$GSLOG" 2>&1 &
+  LPID=$!
+  for _ in $(seq 100); do
+    [ -S "$XDG_RUNTIME_DIR/mdrv-ds-launcher.sock" ] && break
+    sleep 0.1
+  done
+  if [ -S "$XDG_RUNTIME_DIR/mdrv-ds-launcher.sock" ]; then
+    echo "[suite] showing launcher overlay on gamescope-0"
+    '"$LAUNCHER_BIN"' toggle || echo "[suite] WARN: launcher toggle rc=$?"
+  else
+    echo "[suite] WARN: launcher socket never appeared (overlay stays hidden)" >&2
+  fi
+  wait $LPID'
+  ROOT="mdrv-ds-launcher (auto-shown)"
+fi
+
+log "starting gamescope (drm, 1080p60); session root: $ROOT"
+: > "$GSLOG"
+export GSLOG
+gamescope --expose-wayland --backend=drm \
+  -W 1920 -H 1080 -w 1920 -h 1080 -r 60 -f -- \
+  bash -c "$INNER" bash "$@" \
+  >>"$GSLOG" 2>&1 &
+GS=$!
+
+log "gamescope pid $GS — session live; launcher overlay should appear shortly"
+wait $GS
+RC=$?
+log "gamescope exited rc=$RC"
+cleanup EXIT
