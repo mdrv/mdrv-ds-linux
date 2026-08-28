@@ -1,0 +1,33 @@
+#!/bin/sh
+# mdrv-ds-hide-hidraw NODE ACTION   (bind|unbind)
+# Hides a device node from other processes by bind-mounting /dev/null over it.
+# Handles STACKED mounts (repeated binds) and BUSY mounts (lazy umount fallback:
+# holders keep their orphaned fd, new opens see the real device again).
+# Exit status is honest: nonzero if the requested state was not reached.
+NODE="$1"; ACTION="${2:-bind}"
+mounted() { grep -q " $NODE " /proc/mounts; }
+case "$ACTION" in
+  unbind)
+    n=0
+    while mounted; do
+      n=$((n+1)); [ $n -gt 16 ] && { echo "unbind failed: still mounted: $NODE" >&2; exit 1; }
+      if ! umount "$NODE" 2>/dev/null; then
+        # busy (a client holds an fd through this mount): detach lazily
+        umount -l "$NODE" 2>/dev/null || { echo "unbind -l failed: $NODE" >&2; exit 1; }
+        echo "lazy unbind (was busy): $NODE" >&2
+      fi
+    done
+    ;;
+  bind)
+    # strip any existing layers first so binds never stack
+    n=0
+    while mounted; do
+      n=$((n+1)); [ $n -gt 16 ] && { echo "pre-clean failed: $NODE" >&2; exit 1; }
+      umount "$NODE" 2>/dev/null || umount -l "$NODE" 2>/dev/null
+    done
+    mount --bind /dev/null "$NODE" || { echo "bind failed: $NODE" >&2; exit 1; }
+    mounted || { echo "bind not visible in /proc/mounts: $NODE" >&2; exit 1; }
+    ;;
+  *)
+    echo "usage: $0 NODE bind|unbind" >&2; exit 2 ;;
+esac

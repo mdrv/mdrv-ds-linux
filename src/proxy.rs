@@ -390,7 +390,7 @@ pub fn fire_test(name: &str) {
 fn hide_hidraw(path: &Path, action: &str) {
     let p = path.to_string_lossy().into_owned();
     match std::process::Command::new("sudo")
-        .args(["-n", "/usr/local/bin/mdrv-gm-hide-hidraw", &p, action])
+        .args(["-n", "/usr/local/bin/mdrv-ds-hide-hidraw", &p, action])
         .status()
     {
         Ok(s) if s.success() => eprintln!("hidraw {action} ok: {p}"),
@@ -860,7 +860,7 @@ fn open_real(explicit: &Option<String>) -> OpenReal {
             match hid::rdesc_size(&file) {
                 Ok(_) => OpenReal::Ok(file, info),
                 Err(e) => OpenReal::Masked(format!(
-                    "{p} opened but not a hidraw ({e}): a leftover /dev/null hide-mount\nis masking the node and a running client (game/Steam) holds it busy.\nClose the holders and rerun, or: sudo /usr/local/bin/mdrv-gm-hide-hidraw {p} unbind"
+                    "{p} opened but not a hidraw ({e}): a leftover /dev/null hide-mount\nis masking the node and a running client (game/Steam) holds it busy.\nClose the holders and rerun, or: sudo /usr/local/bin/mdrv-ds-hide-hidraw {p} unbind"
                 )),
             }
         }
