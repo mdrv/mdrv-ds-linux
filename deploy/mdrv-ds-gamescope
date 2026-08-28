@@ -176,6 +176,11 @@ WAIT_SOCKET='
     exit 1
   fi
   export WAYLAND_DISPLAY=gamescope-0
+  # Compositor readiness: the socket existing does NOT mean the scene is
+  # live yet — daemons started at socket-time got their layer surfaces
+  # mapped but never composited (black screen) in the 2026-08-28 session.
+  # Give gamescope time to finish output setup before any client connects.
+  sleep 2
   echo "[suite] gamescope-0 up $(date +%H:%M:%S); starting suite daemons"
 '
 START_D() {
