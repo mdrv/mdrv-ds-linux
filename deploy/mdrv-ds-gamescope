@@ -191,12 +191,14 @@ WAIT_SOCKET='
 # window (xdg toplevel) presents a frame — layer-shell overlays alone leave
 # the CRTC scanning out the frozen console text (2026-08-28 session: suite
 # + visible launcher, yet the tty stayed frozen until a plain mpv window
-# connected and everything appeared at once). A black fullscreen mpv is the
-# persistent "live window" that flips scanout over to the compositor; the
-# suite overlays composite on top of it.
+# connected and everything appeared at once). A tiny WINDOWED black mpv is
+# the persistent "live window" that flips scanout over to the compositor;
+# gamescope's own background is black so the 64x64 window is invisible.
+# NOT fullscreen: a later-mapped fullscreen window (mpv --fs) takes over
+# the whole scanout and covers the X11 launcher window (2026-08-28 session).
 BG_WINDOW='
   if command -v mpv >/dev/null 2>&1; then
-    mpv --fs --no-audio --really-quiet --force-window=yes --loop=inf \
+    env -u WAYLAND_DISPLAY DISPLAY=:0 mpv --geometry=64x64 --no-audio --really-quiet --force-window=yes --loop=inf \
       av://lavfi:color=black >>"$GSLOG" 2>&1 &
     echo "[suite] background window started (black mpv, pid $!)"
   else
