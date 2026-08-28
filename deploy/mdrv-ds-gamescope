@@ -177,6 +177,9 @@ WAIT_SOCKET='
     exit 1
   fi
   export WAYLAND_DISPLAY=gamescope-0
+  # Marker for suite clients (the X11-mode launcher has WAYLAND_DISPLAY
+  # unset, so it detects the session via this instead).
+  export MDRV_DS_SESSION=gamescope
   # Compositor readiness: the socket existing does NOT mean the scene is
   # live yet — daemons started at socket-time got their layer surfaces
   # mapped but never composited in the 2026-08-28 session. Give gamescope
@@ -201,17 +204,24 @@ BG_WINDOW='
   fi
 '
 START_D() {
-  # Daemons are started in the given order: gamescope wlserver stacks layer
-  # surfaces by MAP order (later = on top), so the launcher goes FIRST and
-  # the popup overlays map above it. DISABLE_GAMESCOPE_WSI stays SET for
-  # the suite too: with the layer active, gpui/blade's swapchain recreate
-  # on first configure hits "wlserver: create_swapchain: Surface already
-  # had a gamescope_swapchain" and the surface never presents (black
-  # screen, 2026-08-28). The disabled path works, just slower (~15 FPS).
+  # Popup daemons are started in the given order: gamescope wlserver stacks
+  # layer surfaces by MAP order (later = on top). DISABLE_GAMESCOPE_WSI
+  # stays SET for the suite too: with the layer active, gpui/blade's
+  # swapchain recreate on first configure hits "wlserver: create_swapchain:
+  # Surface already had a gamescope_swapchain" and the surface never
+  # presents (black screen, 2026-08-28). The disabled path works, just
+  # slower (~15 FPS). The LAUNCHER (if in the list) runs as a normal X11
+  # window instead — wlserver composites only ONE layer surface at a time,
+  # so as a layer it would hide the popups (or be hidden by them); as an
+  # XWayland toplevel it coexists with the popups exactly like a game.
   echo "
   for d in $*; do
     echo \"[suite] starting mdrv-ds-\$d on gamescope-0\"
-    /g/mdrv-ds-\$d/target/release/mdrv-ds-\$d daemon start --foreground >>\"\$GSLOG\" 2>&1 &
+    if [ \"\$d\" = launcher ]; then
+      env -u WAYLAND_DISPLAY DISPLAY=:0 /g/mdrv-ds-\$d/target/release/mdrv-ds-\$d daemon start --foreground >>\"\$GSLOG\" 2>&1 &
+    else
+      /g/mdrv-ds-\$d/target/release/mdrv-ds-\$d daemon start --foreground >>\"\$GSLOG\" 2>&1 &
+    fi
   done"
 }
 LAUNCHER_BIN=/g/mdrv-ds-launcher/target/release/mdrv-ds-launcher
@@ -222,11 +232,12 @@ if [ $# -gt 0 ]; then
   exec "$@"'
   ROOT="$*"
 else
-  # Launcher maps first (bottom of the layer stack — see START_D note),
-  # then the popups; the toggle-show comes last so the carousel is already
-  # up when the user gets the screen.
+  # Launcher runs as a normal X11 (XWayland) window: show = activate,
+  # hide = minimize. Popups map as layer surfaces afterwards; the toggle
+  # comes last so the carousel is already raised when the user gets the
+  # screen.
   INNER="$WAIT_SOCKET$BG_WINDOW"'
-  '"$LAUNCHER_BIN"' daemon start --foreground >>"$GSLOG" 2>&1 &
+  env -u WAYLAND_DISPLAY DISPLAY=:0 '"$LAUNCHER_BIN"' daemon start --foreground >>"$GSLOG" 2>&1 &
   LPID=$!
   for _ in $(seq 100); do
     [ -S "$XDG_RUNTIME_DIR/mdrv-ds-launcher.sock" ] && break
