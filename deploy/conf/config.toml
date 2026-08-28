@@ -87,3 +87,8 @@ swap_confirm_cancel = false
 margin = 36.0
 battery_low = 20
 battery_notify = true
+
+# Analog-stick shaping (mdrv-ds keymap reload to apply)
+[input]
+inner_dz = 0.0   # centre dead band
+outer_dz = 0.9   # |v| >= outer maps to full deflection

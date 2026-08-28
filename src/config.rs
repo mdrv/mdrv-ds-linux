@@ -29,11 +29,36 @@ pub struct Config {
     pub notify: NotifyConfig,
     #[serde(default)]
     pub audio: AudioConfig,
+    #[serde(default)]
+    pub input: InputConfig,
 }
 
 impl Config {
     pub fn l2cap(&self) -> bool {
         self.transport.as_deref() == Some("l2cap")
+    }
+}
+
+/// `[input]` table — analog-stick shaping applied on relay (all pads,
+/// both transports). Values are fractions of stick half-range.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default)]
+pub struct InputConfig {
+    /// Inner deadzone 0.0..~0.95: |v| ≤ inner maps to exact centre.
+    pub inner_dz: f32,
+    /// Outer deadzone 0.0..1.0: |v| ≥ outer maps to FULL deflection, so
+    /// pads whose sticks never physically reach 1.0 (typical: ~0.99 on
+    /// DualSense) still register 100% in games. The in-between mapping is
+    /// linear and continuous (no cliffs).
+    pub outer_dz: f32,
+}
+
+impl Default for InputConfig {
+    fn default() -> Self {
+        Self {
+            inner_dz: 0.0,
+            outer_dz: 0.9,
+        }
     }
 }
 

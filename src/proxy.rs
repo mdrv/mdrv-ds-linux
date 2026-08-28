@@ -605,6 +605,7 @@ pub fn run(opts: ProxyOpts) -> i32 {
         cfg.ps.hold_cmd(),
     );
     let mut ps_swallow = cfg.ps.swallow();
+    let mut stick_dz = (cfg.input.inner_dz, cfg.input.outer_dz);
     let mut tone: Option<audio::Tone> = None;
     let mut audio_sink: Option<sink::Sink> = None;
     if !chords.bindings.is_empty() {
@@ -682,6 +683,11 @@ pub fn run(opts: ProxyOpts) -> i32 {
             info.hw_version,
             info.rdesc.len()
         );
+        if matches!(info.transport, Transport::Usb) {
+            // USB: the pad's audio is the kernel UAC sink ("Wireless
+            // Controller") — make it default so audio follows the pad.
+            follow_pad_sink(true);
+        }
 
         let virtual_uniq = derive_virtual_mac(&info.uniq);
         let virtual_mac: [u8; 6] =
@@ -850,6 +856,7 @@ pub fn run(opts: ProxyOpts) -> i32 {
                 &hid::feature_lengths(&info.rdesc),
                 ctrl.is_some(),
             ));
+            follow_pad_sink(false);
         }
 
         let code = relay_loop(
@@ -862,6 +869,7 @@ pub fn run(opts: ProxyOpts) -> i32 {
             &virtual_mac,
             &mut chords,
             &mut ps_swallow,
+            &mut stick_dz,
             session_is_l2cap,
             l2cap_features.as_mut(),
         );
@@ -904,6 +912,56 @@ enum OpenReal {
 /// Clean shutdown while waiting for a pad (no session is live): stop the
 /// test tone / audio sink, drop the pidfile. The holder keeps the virtual
 /// pad alive across proxy exits.
+/// Transport-change hook: point the PulseAudio/PipeWire default sink at the
+/// pad so game/desktop audio follows it across BT ↔ USB swaps — each
+/// transport exposes a DIFFERENT sink (ours on BT, the kernel UAC device on
+/// USB) and streams left behind on the vanished one get bounced by
+/// WirePlumber. Fired once per pad (re)connect only; manual default
+/// switches afterwards are never fought. Off-thread with brief retries —
+/// PW registration lags hidraw discovery and sink::start.
+fn follow_pad_sink(usb: bool) {
+    std::thread::spawn(move || {
+        let pactl = |args: &[&str]| {
+            std::process::Command::new("pactl")
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .output()
+        };
+        for _ in 0..10 {
+            let Ok(out) = pactl(&["list", "sinks", "short"]) else {
+                std::thread::sleep(Duration::from_secs(1));
+                continue;
+            };
+            let sinks = String::from_utf8_lossy(&out.stdout);
+            let target = if usb {
+                sinks.lines().find_map(|l| {
+                    let mut f = l.split_whitespace();
+                    f.next()?;
+                    let name = f.next()?;
+                    (name.starts_with("alsa_output.usb-Sony")
+                        && (name.contains("DualSense") || name.contains("DualShock")))
+                    .then(|| name.to_string())
+                })
+            } else {
+                sinks
+                    .contains("mdrv-ds.dualsense-bt")
+                    .then(|| "mdrv-ds.dualsense-bt".to_string())
+            };
+            if let Some(name) = target {
+                match pactl(&["set-default-sink", &name]) {
+                    Ok(_) => eprintln!("sink: default → {name}"),
+                    Err(e) => eprintln!("sink: set-default failed: {e}"),
+                }
+                return;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        eprintln!("sink: default-switch skipped (pad sink not seen)");
+    });
+}
+
 fn proxy_exit(tone: &mut Option<audio::Tone>, audio_sink: &mut Option<sink::Sink>) -> i32 {
     eprintln!("proxy: exit (virtual pad kept alive by holder)");
     if let Some(t) = tone.as_mut() {
@@ -958,6 +1016,7 @@ fn relay_loop(
     virtual_mac: &[u8; 6],
     chords: &mut ChordState,
     ps_swallow: &mut bool,
+    stick_dz: &mut (f32, f32),
     l2cap: bool,
     mut features: Option<&mut std::collections::HashMap<u8, Vec<u8>>>,
 ) -> i32 {
@@ -1039,16 +1098,19 @@ fn relay_loop(
         if RELOAD.swap(false, Ordering::Relaxed) {
             let cfg = config::load();
             *chords = ChordState::new(
-        config::parse_chords(&cfg).list,
-        cfg.notify.clone(),
-        cfg.ps.tap_cmd(),
-        cfg.ps.hold_cmd(),
-    );
+                config::parse_chords(&cfg).list,
+                cfg.notify.clone(),
+                cfg.ps.tap_cmd(),
+                cfg.ps.hold_cmd(),
+            );
             *ps_swallow = cfg.ps.swallow();
+            *stick_dz = (cfg.input.inner_dz, cfg.input.outer_dz);
             eprintln!(
-                "config reloaded: {} chord(s), ps={}",
+                "config reloaded: {} chord(s), ps={}, sticks(inner={:.2}, outer={:.2})",
                 chords.bindings.len(),
-                if *ps_swallow { "swallow" } else { "pass" }
+                if *ps_swallow { "swallow" } else { "pass" },
+                stick_dz.0,
+                stick_dz.1
             );
         }
         let timeout_ms: i32 = 250;
@@ -1153,8 +1215,8 @@ fn relay_loop(
                     }
                     if gate.load(Ordering::Relaxed) {
                         gate_input(&mut report, &layout);
-                    } else if opts.deadzone {
-                        clamp_sticks(&mut report, &layout);
+                    } else {
+                        scale_sticks(&mut report, &layout, stick_dz.0, stick_dz.1);
                     }
                     if l2cap {
                         dump_input(&mut input_dump, &report, &in_buf[..n]);
@@ -1541,19 +1603,30 @@ fn gate_input(report: &mut [u8], l: &InputLayout) {
     report[l.btn0 + 2] = 0x00;
 }
 
-const STICK_DEADZONE: f32 = 0.05;
-
-/// Radial stick deadzone: clamp near-centre pairs to exact centre.
-fn clamp_sticks(report: &mut [u8], l: &InputLayout) {
+/// Per-axis stick shaping (inner + outer deadzone, linear in between):
+/// |v| ≤ inner → centre; |v| ≥ outer → full deflection; else rescaled
+/// (v-inner)/(outer-inner) so the curve is continuous — with the 0.0/0.9
+/// defaults, 0.45 maps to 0.5. Sticks are 8-bit, centre 0x80.
+fn scale_sticks(report: &mut [u8], l: &InputLayout, inner: f32, outer: f32) {
+    let inner = inner.clamp(0.0, 0.95);
+    let outer = outer.clamp(inner + 0.01, 1.0);
+    let span = outer - inner;
     for base in [l.stick0, l.stick0 + 2] {
         if report.len() < base + 2 {
             continue;
         }
-        let dx = (report[base] as f32 - 128.0) / 128.0;
-        let dy = (report[base + 1] as f32 - 128.0) / 128.0;
-        if dx * dx + dy * dy < STICK_DEADZONE * STICK_DEADZONE {
-            report[base] = 0x80;
-            report[base + 1] = 0x80;
+        for o in 0..2 {
+            let v = (report[base + o] as f32 - 128.0) / 128.0;
+            let a = v.abs();
+            let out = if a <= inner {
+                0.0
+            } else if a >= outer {
+                1.0
+            } else {
+                (a - inner) / span
+            };
+            let scaled = out * v.signum();
+            report[base + o] = (128.0 + scaled * 128.0).round().clamp(0.0, 255.0) as u8;
         }
     }
 }
