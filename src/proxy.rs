@@ -605,7 +605,7 @@ pub fn run(opts: ProxyOpts) -> i32 {
         cfg.ps.hold_cmd(),
     );
     let mut ps_swallow = cfg.ps.swallow();
-    let mut stick_dz = (cfg.input.inner_dz, cfg.input.outer_dz);
+    let mut stick_dz = cfg.input;
     let mut tone: Option<audio::Tone> = None;
     let mut audio_sink: Option<sink::Sink> = None;
     if !chords.bindings.is_empty() {
@@ -1016,7 +1016,7 @@ fn relay_loop(
     virtual_mac: &[u8; 6],
     chords: &mut ChordState,
     ps_swallow: &mut bool,
-    stick_dz: &mut (f32, f32),
+    stick_dz: &mut crate::config::InputConfig,
     l2cap: bool,
     mut features: Option<&mut std::collections::HashMap<u8, Vec<u8>>>,
 ) -> i32 {
@@ -1104,13 +1104,14 @@ fn relay_loop(
                 cfg.ps.hold_cmd(),
             );
             *ps_swallow = cfg.ps.swallow();
-            *stick_dz = (cfg.input.inner_dz, cfg.input.outer_dz);
+            *stick_dz = cfg.input;
             eprintln!(
-                "config reloaded: {} chord(s), ps={}, sticks(inner={:.2}, outer={:.2})",
+                "config reloaded: {} chord(s), ps={}, sticks(enabled={}, inner={:.2}, outer={:.2})",
                 chords.bindings.len(),
                 if *ps_swallow { "swallow" } else { "pass" },
-                stick_dz.0,
-                stick_dz.1
+                stick_dz.enabled,
+                stick_dz.inner_dz,
+                stick_dz.outer_dz
             );
         }
         let timeout_ms: i32 = 250;
@@ -1216,7 +1217,14 @@ fn relay_loop(
                     if gate.load(Ordering::Relaxed) {
                         gate_input(&mut report, &layout);
                     } else {
-                        scale_sticks(&mut report, &layout, stick_dz.0, stick_dz.1);
+                        if stick_dz.enabled {
+                            scale_sticks(
+                                &mut report,
+                                &layout,
+                                stick_dz.inner_dz,
+                                stick_dz.outer_dz,
+                            );
+                        }
                     }
                     if l2cap {
                         dump_input(&mut input_dump, &report, &in_buf[..n]);

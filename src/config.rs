@@ -42,20 +42,36 @@ impl Config {
 /// `[input]` table — analog-stick shaping applied on relay (all pads,
 /// both transports). Values are fractions of stick half-range.
 #[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(default)]
 pub struct InputConfig {
+    /// Master switch: false = NO translation at all — raw stick bytes are
+    /// relayed verbatim (pre-deadzone-feature behaviour).
+    #[serde(default = "dz_enabled")]
+    pub enabled: bool,
     /// Inner deadzone 0.0..~0.95: |v| ≤ inner maps to exact centre.
+    #[serde(default = "dz_zero")]
     pub inner_dz: f32,
     /// Outer deadzone 0.0..1.0: |v| ≥ outer maps to FULL deflection, so
     /// pads whose sticks never physically reach 1.0 (typical: ~0.99 on
     /// DualSense) still register 100% in games. The in-between mapping is
     /// linear and continuous (no cliffs).
+    #[serde(default = "dz_outer")]
     pub outer_dz: f32,
+}
+
+fn dz_enabled() -> bool {
+    true
+}
+fn dz_zero() -> f32 {
+    0.0
+}
+fn dz_outer() -> f32 {
+    0.9
 }
 
 impl Default for InputConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             inner_dz: 0.0,
             outer_dz: 0.9,
         }
