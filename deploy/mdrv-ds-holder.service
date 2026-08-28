@@ -1,0 +1,11 @@
+[Unit]
+Description=mdrv-ds virtual-pad holder (owns /dev/uhid)
+After=graphical-session.target
+
+[Service]
+ExecStart=/g/mdrv-ds/target/release/mdrv-ds holder
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

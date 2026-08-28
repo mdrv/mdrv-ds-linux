@@ -1,0 +1,32 @@
+#!/bin/sh
+# mdrv-gm-label-mount mount <dev> <label> | unmount <label>
+# Mounts a labeled game drive at the mdrv-gm conventional path
+# /mnt/label/<LABEL> (plain mount, no udisks /run/media indirection).
+# Invoked via passwordless sudo -n from the mdrv-gm daemon.
+ACTION="$1"
+case "$ACTION" in
+  mount)
+    DEV="$2"; LABEL="$3"
+    [ -b "$DEV" ] || { echo "no such block device: $DEV" >&2; exit 1; }
+    DEST="/mnt/label/$LABEL"
+    mkdir -p "$DEST"
+    # fat/ntfs families take uid/gid so the invoking user can read/write;
+    # ext4/btrfs/xfs keep on-disk ownership.
+    U=${SUDO_UID:-1000}; G=${SUDO_GID:-1000}
+    FSTYPE=$(blkid -o value -s TYPE "$DEV" 2>/dev/null)
+    case "$FSTYPE" in
+      exfat|vfat|ntfs*|msdos)
+        mount "$DEV" "$DEST" -o "uid=$U,gid=$G" ;;
+      *)
+        mount "$DEV" "$DEST" ;;
+    esac
+    ;;
+  unmount)
+    LABEL="$2"
+    umount "/mnt/label/$LABEL"
+    ;;
+  *)
+    echo "usage: $0 mount <dev> <label> | unmount <label>" >&2
+    exit 2
+    ;;
+esac

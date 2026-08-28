@@ -1,3 +1,4 @@
+mod audiobridge;
 mod audio;
 mod config;
 mod hid;

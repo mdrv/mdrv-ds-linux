@@ -171,7 +171,13 @@ pub fn chord_button(name: &str) -> Option<(usize, u8)> {
         // stick0+4 / stick0+5) and zeroes the analog byte while swallowed
         "l2" => (TRIG_L2, 0),
         "r2" => (TRIG_R2, 0),
-        // D-pad deliberately unsupported: mdrv-gm's overlay navigation uses it
+        // D-pad directions: hat-switch compass (low nibble of byte 0);
+        // sentinels resolved by the chord engine, hat neutralized while
+        // such a chord is active
+        "up" | "dpad_up" => (HAT_UP, 0),
+        "down" | "dpad_down" => (HAT_DOWN, 0),
+        "left" | "dpad_left" => (HAT_LEFT, 0),
+        "right" | "dpad_right" => (HAT_RIGHT, 0),
         _ => return None,
     })
 }
@@ -179,6 +185,11 @@ pub fn chord_button(name: &str) -> Option<(usize, u8)> {
 /// Sentinel byte-offsets marking analog-trigger chords (L2/R2).
 pub const TRIG_L2: usize = 0xF0;
 pub const TRIG_R2: usize = 0xF1;
+/// Sentinel byte-offsets marking d-pad hat chords.
+pub const HAT_UP: usize = 0xF2;
+pub const HAT_DOWN: usize = 0xF3;
+pub const HAT_LEFT: usize = 0xF4;
+pub const HAT_RIGHT: usize = 0xF5;
 
 /// Parsed chord bindings: (name, byte offset, bit, shell command).
 pub struct Chords {
@@ -192,21 +203,7 @@ pub fn parse_chords(cfg: &Config) -> Chords {
     let mut list = Vec::new();
     for (name, action) in &cfg.chords {
         let Some((byte, bit)) = chord_button(name) else {
-            if matches!(
-                name.to_lowercase().as_str(),
-                "up" | "down"
-                    | "left"
-                    | "right"
-                    | "dpad"
-                    | "dpad_up"
-                    | "dpad_down"
-                    | "dpad_left"
-                    | "dpad_right"
-            ) {
-                eprintln!("chords: D-pad ({name}) reserved for overlay navigation (skipped)");
-            } else {
-                eprintln!("chords: unknown button name {name:?} (skipped)");
-            }
+            eprintln!("chords: unknown button name {name:?} (skipped)");
             continue;
         };
         let cmd = match action.strip_prefix("shell:") {

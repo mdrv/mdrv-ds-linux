@@ -167,6 +167,8 @@ struct ChordState {
     swallow: [u8; 3],
     /// analog L2/R2 to zero while their chord is active
     swallow_trig: [bool; 2],
+    /// force the d-pad hat to neutral while a hat chord is active
+    swallow_hat: bool,
     /// on reload, treat first report as "everything already pressed" (no refire)
     skip_edges: bool,
     /// [notify] event-callback config (reported on every chord fire)
@@ -184,6 +186,7 @@ impl ChordState {
             prev_pressed: vec![false; n],
             swallow: [0; 3],
             swallow_trig: [false; 2],
+            swallow_hat: false,
             skip_edges: true,
             notify,
         }
@@ -200,12 +203,13 @@ impl ChordState {
         for (i, (name, byte, bit, cmd)) in self.bindings.iter().enumerate() {
             // L2/R2 are analog (no digital bit): pressed = value over threshold
             let pressed = match *byte {
-                config::TRIG_L2 => report
-                    .get(l.stick0 + 4)
-                    .is_some_and(|&v| v > TRIG_THRESHOLD),
-                config::TRIG_R2 => report
-                    .get(l.stick0 + 5)
-                    .is_some_and(|&v| v > TRIG_THRESHOLD),
+                config::TRIG_L2 => report.get(l.trig0).is_some_and(|&v| v > TRIG_THRESHOLD),
+                config::TRIG_R2 => report.get(l.trig0 + 1).is_some_and(|&v| v > TRIG_THRESHOLD),
+                // d-pad hats: compass nibble, pressed = direction active
+                config::HAT_UP => crate::audiobridge::hat_dirs(report[l.btn0] & 0x0f)[0],
+                config::HAT_DOWN => crate::audiobridge::hat_dirs(report[l.btn0] & 0x0f)[2],
+                config::HAT_LEFT => crate::audiobridge::hat_dirs(report[l.btn0] & 0x0f)[3],
+                config::HAT_RIGHT => crate::audiobridge::hat_dirs(report[l.btn0] & 0x0f)[1],
                 _ => report[l.btn0 + byte] & bit != 0,
             };
             let fire = ps_down && pressed && !self.prev_pressed[i] && !self.skip_edges;
@@ -222,6 +226,11 @@ impl ChordState {
                     self.swallow_trig[0] = true;
                 } else if *byte == config::TRIG_R2 {
                     self.swallow_trig[1] = true;
+                } else if matches!(
+                    *byte,
+                    config::HAT_UP | config::HAT_DOWN | config::HAT_LEFT | config::HAT_RIGHT
+                ) {
+                    self.swallow_hat = true;
                 } else {
                     self.swallow[*byte] |= bit;
                 }
@@ -232,6 +241,7 @@ impl ChordState {
         if !ps_down {
             self.swallow = [0; 3];
             self.swallow_trig = [false; 2];
+            self.swallow_hat = false;
         }
         self.skip_edges = false;
         toggle_ps
@@ -245,11 +255,15 @@ impl ChordState {
             report[l.btn0 + i] &= !*mask;
         }
         // zero swallowed analog triggers
-        if self.swallow_trig[0] && report.len() > l.stick0 + 4 {
-            report[l.stick0 + 4] = 0;
+        if self.swallow_trig[0] && report.len() > l.trig0 {
+            report[l.trig0] = 0;
         }
-        if self.swallow_trig[1] && report.len() > l.stick0 + 5 {
-            report[l.stick0 + 5] = 0;
+        if self.swallow_trig[1] && report.len() > l.trig0 + 1 {
+            report[l.trig0 + 1] = 0;
+        }
+        // neutralize the hat nibble while a d-pad chord is active
+        if self.swallow_hat {
+            report[l.btn0] = (report[l.btn0] & 0xf0) | 0x08;
         }
     }
 
@@ -416,14 +430,15 @@ fn cleanup_stale_mounts() {
 }
 
 const DS_VENDOR: u32 = 0x054c;
-const DS_PRODUCT: u32 = 0x0ce6;
 
 // gameplay-field offsets relative to report start, per transport
 // USB input: [0]=0x01, sticks 1..=6, buttons 8/9/10
 // BT input:  [0]=0x31, [1]=seq, sticks 2..=7, buttons 9/10/11
-struct InputLayout {
-    stick0: usize,
-    btn0: usize,
+pub(crate) struct InputLayout {
+    pub(crate) stick0: usize,
+    pub(crate) btn0: usize,
+    /// analog trigger byte offset (L2 at trig0, R2 at trig0+1)
+    pub(crate) trig0: usize,
     report_id: u8,
 }
 
@@ -432,11 +447,13 @@ fn layout_for(transport: Transport) -> InputLayout {
         Transport::Usb => InputLayout {
             stick0: 1,
             btn0: 8,
+            trig0: 5,
             report_id: 0x01,
         },
         Transport::Bluetooth => InputLayout {
             stick0: 2,
             btn0: 9,
+            trig0: 6,
             report_id: 0x31,
         },
     }
@@ -456,6 +473,33 @@ fn dump_input(out: &mut Option<(std::fs::File, usize)>, rpt: &[u8], raw: &[u8]) 
         hid::hex(rpt),
         hid::hex(&raw[..raw.len().min(78)])
     );
+}
+
+/// Desktop toast for 3.5mm jack (dis)connect. Best-effort: off-thread so
+/// the relay loop never blocks on the notifier, output discarded.
+fn notify_jack(plugged: bool) {
+    let (summary, body) = if plugged {
+        ("Headset connected", "Routing audio to the controller jack")
+    } else {
+        (
+            "Headset disconnected",
+            "Routing audio to the controller speaker",
+        )
+    };
+    std::thread::spawn(move || {
+        let mut cmd = std::process::Command::new("/g/mdrv-ds-notify/scripts/mdrv-notify");
+        cmd.args(["-a", "mdrv-ds", "-t", "2500", summary, body]);
+        if std::env::var("WAYLAND_DISPLAY").is_err() {
+            // Service env may lack the compositor socket (notifications
+            // need it); wayland-1 is this session's display.
+            cmd.env("WAYLAND_DISPLAY", "wayland-1");
+        }
+        let _ = cmd
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    });
 }
 
 /// All-neutral input report for a transport (USB only — BT input reports
@@ -481,6 +525,7 @@ pub fn run(opts: ProxyOpts) -> i32 {
     install_signal_handlers();
     tee_stderr_to_file("proxy.log");
     write_pidfile();
+    crate::audiobridge::start();
     cleanup_stale_mounts();
     let cfg = config::load();
     let mut chords = ChordState::new(config::parse_chords(&cfg).list, cfg.notify.clone());
@@ -593,11 +638,15 @@ pub fn run(opts: ProxyOpts) -> i32 {
                 _ => uhid::BUS_BLUETOOTH,
             },
             vendor: DS_VENDOR,
-            product: DS_PRODUCT,
+            product: info.product,
             version: info.fw_version,
-            // Exact stock name: games (FF7R/FF16) name-match "DualSense
+            // Exact stock names: games (FF7R/FF16) name-match "DualSense
             // Wireless Controller" for DualSense-specific input routing.
-            name: "DualSense Wireless Controller".to_string(),
+            name: if info.product == crate::hid::PRODUCT_DS4 {
+                "DualShock 4 Wireless Controller".to_string()
+            } else {
+                "DualSense Wireless Controller".to_string()
+            },
             uniq: virtual_uniq.clone(),
             rdesc: info.rdesc.clone(),
         };
@@ -704,7 +753,10 @@ pub fn run(opts: ProxyOpts) -> i32 {
             t.stop();
         }
         tone = None;
-        if matches!(info.transport, Transport::Bluetooth) && cfg.audio.test_tone {
+        if matches!(info.transport, Transport::Bluetooth)
+            && info.product != crate::hid::PRODUCT_DS4
+            && cfg.audio.test_tone
+        {
             tone = Some(audio::start(&real, &cfg.audio));
         }
 
@@ -713,7 +765,10 @@ pub fn run(opts: ProxyOpts) -> i32 {
             s.stop();
         }
         audio_sink = None;
-        if matches!(info.transport, Transport::Bluetooth) && cfg.audio.sink != Some(false) {
+        if matches!(info.transport, Transport::Bluetooth)
+            && info.product != crate::hid::PRODUCT_DS4
+            && cfg.audio.sink != Some(false)
+        {
             audio_sink = Some(sink::start(
                 &real,
                 &cfg.audio,
@@ -735,11 +790,13 @@ pub fn run(opts: ProxyOpts) -> i32 {
             session_is_l2cap,
             l2cap_features.as_mut(),
         );
+        eprintln!("teardown: relay loop returned (pad fd closed or exit requested)");
         // Undo the real pad's node masking; the virtual pad itself is owned
         // by the holder and outlives this proxy process.
         for n in &hidden {
             hide_hidraw(n, "unbind");
         }
+        eprintln!("teardown: hidraw unmounts done");
         drop(sock); // holder emits the stored neutral report on this EOF
         if EXIT.load(Ordering::Relaxed) || code == 2 {
             eprintln!("proxy: exit (virtual pad kept alive by holder)");
@@ -831,8 +888,18 @@ fn relay_loop(
 ) -> i32 {
     // The virtual pad carries the transport's NATIVE descriptor on L2CAP
     // (BT presentation — see run()), so everything downstream speaks the
-    // BT layout.
-    let layout = layout_for(info.transport);
+    // transport's layout; a DualShock 4 L2CAP session speaks 0x11 instead.
+    let ds4 = l2cap && info.product == crate::hid::PRODUCT_DS4;
+    let layout = if ds4 {
+        InputLayout {
+            stick0: 3,
+            btn0: 7,
+            trig0: 10,
+            report_id: 0x11,
+        }
+    } else {
+        layout_for(info.transport)
+    };
     let flens = hid::feature_lengths(&info.rdesc);
     let real_fd = real.as_raw_fd();
     let sock_fd = sock.as_raw_fd();
@@ -860,6 +927,17 @@ fn relay_loop(
             .map(|f| (f, 0usize))
     });
     let mut eofs: u32 = 0;
+    // Jack-detect debounce (integrator): the HP-detect byte (input 0x31
+    // byte 56) is noisy — while PLUGGED the bit is high-dominant but
+    // flutters low (byte jumps 0x01/0x65/0x11/0x64), and around an
+    // UNPLUG isolated high-garbage frames appear (0x19 observed). So:
+    // charge +1 per high frame (max 16), discharge -4 per low frame;
+    // engage at 16 (≈25 ms of high-dominant input — single garbage
+    // frames can't reach it), disengage only after 800 ms with ZERO
+    // high frames (flutter can never trip it).
+    let mut jack_int: u32 = 0;
+    let mut jack_raw_since = now0;
+    let mut jack_latched = false;
 
     loop {
         let now = std::time::Instant::now();
@@ -918,12 +996,39 @@ fn relay_loop(
                     } else {
                         raw.to_vec()
                     };
-                    // Jack detect for the BT audio sink: input 0x31 byte 56
-                    // bit0 (kernel dualsense_input_report.status[1]; the
-                    // spec's "byte 55" is off by one). Read from the BT frame
-                    // BEFORE translation. Inert on USB (0x01).
-                    if report.len() > 56 && report[0] == 0x31 {
-                        sink::JACK_PLUGGED.store(report[56] & 0x01 != 0, Ordering::Relaxed);
+                    // Jack detect for the BT audio sink: HP-detect is
+                    // BT frame byte 56 bit0 (= report[55]; kernel
+                    // dualsense_input_report.status[2] with the USB payload
+                    // starting at raw[3]). Verified empirically over 93k
+                    // frames: plugged → raw[56]=0x01 constant, unplugged →
+                    // 0x00. The OLD code read report[56] (raw[57]) — constant
+                    // 0 in every state, hence "speaker always". Neighbors
+                    // raw[52..53]/[58..61] are counters/CRC noise. Hysteresis
+                    // (see decl above): integrator arms plug at 16 net
+                    // highs; 800 ms with zero highs unlatches.
+                    if report.len() > 55 && report[0] == 0x31 {
+                        let raw = report[55] & 0x01 != 0;
+                        let before = jack_latched;
+                        if raw {
+                            jack_int = (jack_int + 1).min(16);
+                            jack_raw_since = now;
+                            if !jack_latched && jack_int >= 16 {
+                                jack_latched = true;
+                            }
+                        } else {
+                            jack_int = jack_int.saturating_sub(4);
+                            if jack_latched
+                                && now.duration_since(jack_raw_since)
+                                    >= std::time::Duration::from_millis(800)
+                            {
+                                jack_latched = false;
+                            }
+                        }
+                        if jack_latched != before {
+                            eprintln!("jack: latch -> {} (b55 {:#04x})", jack_latched, report[55]);
+                            notify_jack(jack_latched);
+                        }
+                        sink::JACK_PLUGGED.store(jack_latched, Ordering::Relaxed);
                     }
                     // L2CAP native passthrough: the virtual pad carries the
                     // BT descriptor, so control frames relay verbatim in
@@ -931,8 +1036,12 @@ fn relay_loop(
                     // low nibble 0x02/0x03) and other frames are dropped —
                     // the kernel would misparse them as input.
                     if l2cap {
-                        let control =
-                            report.len() >= 65 && report[0] == 0x31 && report[1] & 0x0F == 0x01;
+                        let control = if report.first() == Some(&0x11) && report.len() == 78 {
+                            // DualShock 4 control frame (CRC intact, kernel-checked)
+                            true
+                        } else {
+                            report.len() >= 65 && report[0] == 0x31 && report[1] & 0x0F == 0x01
+                        };
                         if !control {
                             continue;
                         }
@@ -946,6 +1055,10 @@ fn relay_loop(
                         chords.notify_ps_toggle(&tname, *ps_swallow);
                     }
                     chords.strip(&mut report, &layout);
+                    // Bridge feed BEFORE the PS strip: watch clients
+                    // (launcher) need the PS edge; hold clients also get
+                    // sticks. Chord-swallowed bits are already zeroed.
+                    crate::audiobridge::feed(&report, &layout);
                     // PS allowlist: "swallow" strips the PS bit from every
                     // relayed report, so games/mdrv-gm never see PS at
                     // all — only mdrv-ds chords (fed above, raw) do.
@@ -953,6 +1066,10 @@ fn relay_loop(
                         if *ps_swallow {
                             report[layout.btn0 + 2] &= !0x01;
                         }
+                    }
+                    // Overlay (hold client) open: the game gets nothing.
+                    if crate::audiobridge::paused() {
+                        continue;
                     }
                     if gate.load(Ordering::Relaxed) {
                         gate_input(&mut report, &layout);
@@ -1008,6 +1125,22 @@ fn relay_loop(
                     // the sink writer so ALL interrupt-channel reports share
                     // one sequence counter (two independent counters make
                     // the pad drop reports — rumble AND audio).
+                    // DualShock 4 L2CAP session: forward kernel outputs
+                    // verbatim on the interrupt channel (kernel-built CRC is
+                    // already valid; no sink/haptics path exists for DS4).
+                    if l2cap
+                        && info.product == crate::hid::PRODUCT_DS4
+                        && data.len() == 78
+                        && data.first() == Some(&0x11)
+                    {
+                        let mut wire = Vec::with_capacity(79);
+                        wire.push(0xA2u8);
+                        wire.extend_from_slice(&data);
+                        if let Err(e) = real.write_all(&wire) {
+                            eprintln!("ds4 output write: {e}");
+                        }
+                        continue;
+                    }
                     let bt_state = info.transport == Transport::Bluetooth
                         && data.len() == 78
                         && data.first() == Some(&0x31);

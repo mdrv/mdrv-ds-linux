@@ -20,13 +20,37 @@ impl Transport {
     }
 }
 
+/// USB product id: DualShock 4.
+pub const PRODUCT_DS4: u32 = 0x05c4;
+/// USB product id: DualSense (kept for named symmetry; DS5 paths use it
+/// implicitly via PadInfo defaults).
+#[allow(dead_code)]
+pub const PRODUCT_DUALSENSE: u32 = 0x0ce6;
+
 pub struct PadInfo {
     pub path: PathBuf,
     pub uniq: String,
     pub transport: Transport,
+    /// USB product id (0x0ce6 DualSense, 0x05c4 DualShock 4).
+    pub product: u32,
     pub fw_version: u32,
     pub hw_version: u32,
     pub rdesc: Vec<u8>,
+}
+
+/// Parse the USB product id from a hidraw node's uevent (HID_ID=bus:vid:pid).
+fn read_product_sysfs(hidraw: &std::path::Path) -> u32 {
+    let uevent = std::fs::read_to_string(hidraw.join("device/uevent")).unwrap_or_default();
+    for line in uevent.lines() {
+        if let Some(id) = line.strip_prefix("HID_ID=") {
+            if let Some(pid) = id.split(':').nth(2) {
+                if let Ok(v) = u32::from_str_radix(pid.trim(), 16) {
+                    return v;
+                }
+            }
+        }
+    }
+    0x0ce6
 }
 
 fn hid_ioc(dir: u32, nr: u8, len: usize) -> u64 {
@@ -161,6 +185,7 @@ pub fn open_pad(explicit: Option<&str>) -> std::io::Result<(File, PadInfo)> {
     };
     let file = OpenOptions::new().read(true).write(true).open(&path)?;
     let info = PadInfo {
+        product: read_product_sysfs(&path),
         fw_version: read_hex_sysfs(&path, "firmware_version").unwrap_or(0),
         hw_version: read_hex_sysfs(&path, "hardware_version").unwrap_or(0),
         rdesc: read_rdesc(&path),

@@ -1,0 +1,19 @@
+[Unit]
+Description=mdrv-ds DualSense proxy
+# display-manager not strictly required (proxy self-heals waiting for the pad),
+# but ordering after it keeps uaccess ACLs sane at boot.
+After=graphical-session.target mdrv-ds-holder.service
+Wants=mdrv-ds-holder.service
+
+[Service]
+ExecStart=/g/mdrv-ds/target/release/mdrv-ds proxy
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=15
+# hide-mount helper is sudoers-gated; make sure PATH keeps sudo findable
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# chord commands (ydotool) need the socket path
+Environment=YDOTOOL_SOCKET=%t/.ydotool_socket
+
+[Install]
+WantedBy=default.target

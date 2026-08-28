@@ -1,0 +1,72 @@
+# mdrv-ds configuration — copy to ~/.config/mdrv-ds/config.toml
+#
+# PS-button chords: while PS is held, pressing a bound button runs a shell
+# command. The button press AND the PS press are swallowed from the relayed
+# report (until PS is released), so games and mdrv-gm's PS-tap never see them.
+# Apply changes with: mdrv-ds keymap reload
+
+transport = "l2cap"
+
+# PS button visibility: "pass" (default) = games/mdrv-gm see PS presses;
+# "swallow" = PS bit stripped from relayed reports — ONLY mdrv-ds chords
+# see the PS button. Flip at runtime with a 'ps:toggle' chord (see below).
+[ps]
+mode = 'swallow'
+
+[chords]
+dpad_right = 'shell:/g/mdrv-ds-notify/target/release/mdrv-ds-notify toggle'
+# screenshot
+share    = 'shell:grim /tmp/shot-$(date +%s).png'
+# MangoHUD toggle (RShift+F12 via ydotool)
+north    = 'shell:ydotool key 54:1 88:1 88:0 54:0'
+# touchpad-as-mouse toggle (mdrv-ds mouse toggle)
+touchpad = 'shell:mdrv-ds mouse toggle'
+# same toggle on R3 (touchpad button doubles as a desktop click when mouse on)
+r3       = 'shell:mdrv-ds mouse toggle'
+# kill-switch: flip PS allowlist at runtime (works even while swallowed)
+l3       = 'ps:toggle'
+# audio overlay toggle (PS+R2): opens/closes the mdrv-ds-audio mixer;
+# the proxy pauses game input while the overlay is connected
+r2       = 'shell:/g/mdrv-ds-audio/target/release/mdrv-ds-audio toggle'
+
+# Button names: south|cross, east|circle, west|square, north|triangle,
+#   l1, r1, l3, r3, l2, r2 (analog, fires past ~25% press), share|create,
+#   options|start, touchpad
+# (D-pad chords intentionally unsupported: mdrv-gm overlay navigation uses them.)
+
+# Event callback: runs `command` via sh -c after every chord fire, with the
+# event as env vars: MDRV_CHORD (button), MDRV_COMMAND (executed command or
+# 'ps:toggle'), MDRV_STATUS (success|failed), MDRV_CODE (exit code),
+# MDRV_OUTPUT (merged stdout+stderr, capped 500B). 'when' = always|on-failure.
+[notify]
+enabled = true
+when    = 'always'
+command = 'notify-send -a mdrv-ds -u low "mdrv-ds" "$MDRV_CHORD: $MDRV_STATUS${MDRV_OUTPUT:+ — $MDRV_OUTPUT}"'
+
+[audio]
+# output=true → 0x35 reports with Opus speaker audio (0x13 TLV).
+# FF16 routes haptic audio through the speaker channel — needs 0x13 TLV.
+sink = true
+output = true
+# Opus CBR bitrate (bps). 96000 = 120 B/frame; 160000 (200 B) is the
+# hardware-verified value — bump here if playback sounds wrong.
+bitrate = 160000
+# absent/false → auto-route: headset jack when 3.5mm plugged (audio +
+# haptics keep flowing), else internal speaker. true → force speaker.
+# speaker = true
+# Aux sink options (defaults shown): aux_sink = true exposes a stereo
+# "DualSense Wireless Controller AUX" sink while the jack is plugged;
+# aux_priority = true routes the AUX sink to the headset when both it
+# and the primary sink are playing.
+# aux_sink = true
+# aux_priority = true
+# Phase 1: continuous 440 Hz test tone over BT (set false/off to stop)
+test_tone = false
+volume = 0x64
+# Writer pacing interval in microseconds (default 10667 = 480/45000).
+# dsneo spec: 200ppm session-specific clock variance between units;
+# sweep showed 10669 flattest for their pad. Try 10667..10671.
+# interval_us commented — testing default 10667
+# Report size: "0x35" (334B, default), "0x39" (547B, larger packet may
+# change BT scheduling), "0x36" (combined state+haptics+audio, L2CAP only).
+report = "0x39"

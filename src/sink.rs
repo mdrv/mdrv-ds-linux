@@ -292,8 +292,11 @@ impl Sink {
             unsafe { pw::sys::pw_main_loop_quit(p as *mut pw::sys::pw_main_loop) };
         }
         for h in self.handles.drain(..) {
-            let _ = h.join();
+            if h.join().is_err() {
+                eprintln!("sink: thread panicked during stop");
+            }
         }
+        eprintln!("sink: all threads joined");
     }
 }
 
@@ -358,9 +361,11 @@ pub fn start(
         .node_description
         .clone()
         .unwrap_or_else(|| "DualSense Wireless Controller".into());
+    let pw_desc = node_desc.clone();
     handles.push(thread::spawn(move || {
-        pw_thread(pw_shared, pw_stop, pw_quit, node_desc)
+        pw_thread(pw_shared, pw_stop, pw_quit, pw_desc)
     }));
+
 
     let fd = unsafe { libc::dup(real.as_raw_fd()) };
     let mut file = unsafe { File::from_raw_fd(fd) };
@@ -584,6 +589,9 @@ fn pw_thread(
     eprintln!("sink: mainloop exited");
 }
 
+
+
+
 // ---- writer thread ---------------------------------------------------------
 
 /// Absorb kernel-relayed output reports (rumble/LED/trigger 0x31s). While the
@@ -611,7 +619,7 @@ fn flush_kernel_outputs(
     last_state47: &mut [u8; 47],
     hp_volume: u8,
     output: bool,
-    force_speaker: bool,
+    jack_path: bool,
     streaming: bool,
     combined: bool,
     l2cap: bool,
@@ -648,7 +656,7 @@ fn flush_kernel_outputs(
                     // own rumble-valid bits — vds apply_usb_output_report) and
                     // keep the 63 B tail; it rides the next 0x36.
                     state63[..47].copy_from_slice(&st);
-                    sink_merge63(state63, hp_volume, output, !force_speaker);
+                    sink_merge63(state63, hp_volume, output, jack_path);
                 } else {
                     // Track ALL state (keep-alives carry LEDs/mic config too).
                     state.copy_from_slice(&st);
@@ -667,7 +675,7 @@ fn flush_kernel_outputs(
             } else if l2cap {
                 // idle: overlay + relay a plain 0x31, only if state changed
                 state63[..47].copy_from_slice(&st);
-                sink_merge63(state63, hp_volume, output, !force_speaker);
+                sink_merge63(state63, hp_volume, output, jack_path);
                 if state63[..47] != *last_state47 {
                     let mut st47b = [0u8; 47];
                     st47b.copy_from_slice(&state63[..47]);
@@ -716,16 +724,29 @@ fn flush_kernel_outputs(
     true
 }
 
-/// L2CAP: overlay volume/path config on the 63 B observed state. Only the
-/// output-gated volumes and the path bits change — the observed tail bytes
-/// (preamp 0x03, LED/fade bytes) are v29-proven and left untouched.
+/// L2CAP: overlay volume/path config on the 63 B observed state, vds
+/// `set_audio_out_stream_active` parity:
+/// * `[4]` always carries the headphone volume (enable bit gates it);
+/// * speaker path: `[5]` = speaker volume, flag0 |= 0x20, audio-control-2
+///   enabled (`[37]` = 0x01, flag1 |= 0x80);
+/// * jack path: `[5]` = 0 and flag0 0x20 CLEARED (speaker must not sound),
+///   flag0 |= 0x10, audio-control-2 disabled (flag1 &= !0x80, `[37]` = 0).
+/// The observed tail bytes are v29-proven and left untouched.
 pub fn sink_merge63(state: &mut [u8; 63], hp_volume: u8, output: bool, jack: bool) {
     state[4] = if output { hp_volume.min(0x7F) } else { 0 };
-    state[5] = if output { 0x64 } else { 0 };
-    // OUTPUT_PATH_SEL (mask 0x30): 0x30 speaker, 0x00 jack — matches the
-    // 0x93/0x96 TLV byte the writer picked for this frame.
     let path = if jack { 0x00 } else { 0x30 };
     state[7] = (state[7] & !0x30) | path;
+    if jack {
+        state[0] = (state[0] | 0x10) & !0x20; // HP vol on, SPEAKER vol off
+        state[1] &= !0x80; // audio-control-2 off
+        state[37] = 0;
+        state[5] = 0;
+    } else {
+        state[0] |= 0x20;
+        state[1] |= 0x80;
+        state[37] = 0x01; // audio_control2 default
+        state[5] = if output { 0x64 } else { 0 };
+    }
 }
 
 fn writer_thread(
@@ -815,11 +836,16 @@ fn writer_thread(
     let mut in_buf: Vec<f32> = Vec::with_capacity(4096);
     let mut pcm = [0i16; FRAME_SAMPLES * 2];
     let mut hap = [0u8; 64];
-
     let mut seq: u8 = 0;
     let mut counter: u8 = 0;
     let mut next = Instant::now() + Duration::from_millis(500); // warm-up
+    let mut keepalive = Instant::now();
     let mut was_jack = JACK_PLUGGED.load(Ordering::Relaxed);
+    let mut jack_dbg = was_jack;
+    // Last path acknowledged to the pad via a mic-state 0x31 (vds parity:
+    // the pad re-announces a headset plug until the host answers with the
+    // matching audio path; see l2cap::mic_state).
+    let mut engaged_jack: Option<bool> = None;
     // Prime from the live edge: wait for real data, then drop any backlog
     // beyond the target fill (PipeWire may have queued a burst during warm-up)
     // so the pad buffer starts near-empty instead of overflowed.
@@ -860,7 +886,10 @@ fn writer_thread(
     // a mic-open 0x32 — both prefixed — before the first (or re-primed)
     // stream. The 0x31 uses the SHARED sequence; the 0x32 its own family.
     let send_l2cap_handshake = |file: &mut File, seq: &mut u8, mic_seq: &mut u8| -> bool {
-        let s31 = crate::audio::state_report(*seq, &crate::l2cap::MIC_STATE);
+        let s31 = crate::audio::state_report(
+            *seq,
+            &crate::l2cap::mic_state(JACK_PLUGGED.load(Ordering::Relaxed)),
+        );
         *seq = (*seq + 1) & 0x0F;
         let s32 = crate::audio::mic_report_032(*mic_seq, true);
         *mic_seq = (*mic_seq + 1) & 0x0F;
@@ -894,6 +923,45 @@ fn writer_thread(
         // Kernel rumble/LED reports: absorbed into the combined report while
         // streaming (vds-style — no interleaved 0x31s on the interrupt
         // channel), relayed directly while idle.
+        let jack_plugged = JACK_PLUGGED.load(Ordering::Relaxed);
+        if jack_plugged != jack_dbg {
+            eprintln!("sink: JACK_PLUGGED load -> {}", jack_plugged);
+            jack_dbg = jack_plugged;
+        }
+        if jack_plugged != was_jack {
+            eprintln!("sink: JACK_PLUGGED load -> {}", jack_plugged);
+            was_jack = jack_plugged;
+        }
+        let jack_path = if force_speaker { false } else { jack_plugged };
+        // Jack engage: answer every plug/unplug edge with a mic-state 0x31
+        // carrying the new path (works while idle too — the pad needs the
+        // ack even when no audio is streaming). Runs before the flush so
+        // the pad latches HP-detect before the next payload arrives.
+        if l2cap && engaged_jack != Some(jack_path) {
+            let ms = crate::audio::state_report(seq, &crate::l2cap::mic_state(jack_path));
+            seq = (seq + 1) & 0x0F;
+            if !(file.write_all(&[0xA2]).is_ok() && file.write_all(&ms).is_ok()) {
+                break;
+            }
+            eprintln!(
+                "sink: jack engage → {} (mic-state 0x31)",
+                if jack_path { "headset" } else { "speaker" }
+            );
+            engaged_jack = Some(jack_path);
+        }
+        // BT idle keep-alive: the pad powers off after a few minutes with
+        // no output traffic. While streaming, the 10 ms 0x36 cadence keeps
+        // it awake; while idle, re-assert a zero-flags 0x31 state report
+        // (applies nothing) every 2 s to reset the pad's sleep timer —
+        // the PC equivalent of the PS5's constant output stream.
+        if l2cap && !primed && keepalive.elapsed() >= Duration::from_millis(2000) {
+            keepalive = Instant::now();
+            let noop = crate::audio::state_report(seq, &[0u8; 47]);
+            seq = (seq + 1) & 0x0F;
+            if !(file.write_all(&[0xA2]).is_ok() && file.write_all(&noop).is_ok()) {
+                break;
+            }
+        }
         if !flush_kernel_outputs(
             file,
             shared,
@@ -903,7 +971,7 @@ fn writer_thread(
             &mut last_state47,
             hp_volume,
             output,
-            force_speaker,
+            jack_path,
             primed,
             combined,
             l2cap,
@@ -984,11 +1052,12 @@ fn writer_thread(
         } else {
             starved_frames = 0;
         }
+        let main_silent = in_buf.iter().all(|s| s.abs() < silence_eps);
         // Silence gate (vds parity): skip the whole window when nothing
         // real is in it — no 0x36 leaves the host during quiet/idle audio,
         // which keeps the pad's input-report cadence clean (the pad bursts
         // its 0x31s between constant 0x36s, and games reject that).
-        if l2cap && in_buf.iter().all(|s| s.abs() < silence_eps) {
+        if l2cap && main_silent {
             in_buf.clear();
             in_pos = 0.0;
             starved_frames = 0;
@@ -1010,7 +1079,6 @@ fn writer_thread(
             continue;
         }
         silent_windows = 0;
-
         // Produce 480 resampled stereo samples (speaker path, ch0/1).
         for s in 0..FRAME_SAMPLES {
             let i0 = in_pos.floor() as usize;
@@ -1049,6 +1117,7 @@ fn writer_thread(
         in_buf.drain(..consumed_pairs * 4);
         in_pos -= consumed_pairs as f64;
 
+
         // Haptics-only: no Opus TLV, no audio path selection — just the
         // 0x12 PCM frame in a minimal 0x32 report.
         let ok = if haptics_only {
@@ -1057,7 +1126,8 @@ fn writer_thread(
             wdump(file, &report)
         } else {
             let mut frame = [0u8; 512];
-            for s in pcm.iter() {
+            let pcm_out: &[i16] = &pcm;
+            for s in pcm_out.iter() {
                 peak_store(&PEAK_PCM, *s as f32 / 32768.0);
             }
             let Some(enc_ref) = enc.as_ref() else {
@@ -1066,7 +1136,7 @@ fn writer_thread(
             let n = unsafe {
                 opus_encode(
                     enc_ref.0,
-                    pcm.as_ptr(),
+                    pcm_out.as_ptr(),
                     FRAME_SAMPLES as libc::c_int,
                     frame.as_mut_ptr(),
                     512,
@@ -1084,9 +1154,8 @@ fn writer_thread(
                 );
                 continue;
             }
-            // Routing follows config: speaker=true → 0x93 TLV + 0x30 path
-            // (internal speaker); absent/false → 0x96 TLV + jack path.
-            let jack = !force_speaker;
+            // Routing follows plug state: jack or speaker per config.
+            let jack = jack_path;
             if jack != was_jack {
                 eprintln!(
                     "sink: routing → {}",
