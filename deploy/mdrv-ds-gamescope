@@ -45,14 +45,13 @@ GSLOG=${MDRV_GS_GAMELOG:-$STATE_DIR/gamescope.gamescope.log}
 mkdir -p "$STATE_DIR"
 log() { printf '%(%H:%M:%S)T %s\n' -1 "$*" | tee -a "$LOG"; }
 
-SERVICES=(mdrv-ds-audio.service mdrv-ds-settings.service
-  mdrv-ds-launcher.service mdrv-ds-notify.service)
+SERVICES=(mdrv-ds-overlay.service mdrv-ds-launcher.service)
 
 # Kill transient suite instances + clear their toggle sockets. Pattern is
 # exact enough to never match the mdrv-ds proxy/holder ("…/mdrv-ds holder").
 suite_pkill() {
-  pkill -f '/target/release/mdrv-ds-(audio|settings|launcher|notify)' 2>/dev/null
-  for n in audio settings launcher notify; do
+  pkill -f '/target/release/mdrv-ds-(overlay|launcher)' 2>/dev/null
+  for n in overlay launcher; do
     rm -f "$XDG_RUNTIME_DIR/mdrv-ds-$n.sock"
   done
 }
@@ -206,8 +205,9 @@ BG_WINDOW='
   fi
 '
 START_D() {
-  # Popup daemons are started in the given order: gamescope wlserver stacks
-  # layer surfaces by MAP order (later = on top). DISABLE_GAMESCOPE_WSI
+  # The OVERLAY is the single layer-shell client (gamescope composites
+  # exactly ONE layer surface — the popups+toasts live in that one
+  # surface now; the launcher runs as X11). DISABLE_GAMESCOPE_WSI
   # stays SET for the suite too: with the layer active, gpui/blade's
   # swapchain recreate on first configure hits "wlserver: create_swapchain:
   # Surface already had a gamescope_swapchain" and the surface never
@@ -230,7 +230,7 @@ LAUNCHER_BIN=/g/mdrv-ds-launcher/target/release/mdrv-ds-launcher
 
 if [ "${1:-}" = "--" ]; then shift; fi
 if [ $# -gt 0 ]; then
-  INNER="$WAIT_SOCKET$BG_WINDOW$(START_D launcher audio settings notify)"'
+  INNER="$WAIT_SOCKET$BG_WINDOW$(START_D launcher overlay)"'
   exec "$@"'
   ROOT="$*"
 else
@@ -252,7 +252,7 @@ else
     '"$LAUNCHER_BIN"' toggle || echo "[suite] WARN: launcher toggle rc=$?"
   else
     echo "[suite] WARN: launcher socket never appeared (overlay stays hidden)" >&2
-  fi'"$(START_D audio settings notify)"'
+  fi'"$(START_D overlay)"'
   wait $LPID'
   ROOT="mdrv-ds-launcher (auto-shown)"
 fi
