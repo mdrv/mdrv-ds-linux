@@ -12,9 +12,16 @@ transport = "l2cap"
 # see the PS button. Flip at runtime with a 'ps:toggle' chord (see below).
 [ps]
 mode = 'swallow'
+# solo PS tap / 3 s hold → launcher help panel (PS+button chord list)
+tap  = 'shell:/g/mdrv-ds-launcher/target/release/mdrv-ds-launcher help'
+hold = 'shell:/g/mdrv-ds-launcher/target/release/mdrv-ds-launcher help'
 
 [chords]
 dpad_right = 'shell:/g/mdrv-ds-notify/target/release/mdrv-ds-notify toggle'
+# launcher toggle (PS+Circle): the main launcher entry point
+east      = 'shell:/g/mdrv-ds-launcher/target/release/mdrv-ds-launcher toggle'
+# settings overlay toggle (PS+Square)
+west      = 'shell:/g/mdrv-ds-settings/target/release/mdrv-ds-settings toggle'
 # screenshot
 share    = 'shell:grim /tmp/shot-$(date +%s).png'
 # MangoHUD toggle (RShift+F12 via ydotool)

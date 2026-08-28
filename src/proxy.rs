@@ -173,13 +173,30 @@ struct ChordState {
     skip_edges: bool,
     /// [notify] event-callback config (reported on every chord fire)
     notify: config::NotifyConfig,
+    /// [ps] tap/hold commands (normalized, 'shell:' stripped)
+    ps_tap: Option<String>,
+    ps_hold: Option<String>,
+    /// solo-PS state machine: pressed / press instant / paired with any
+    /// other button (chord or game input) / hold already fired
+    ps_held: bool,
+    ps_held_since: Option<std::time::Instant>,
+    ps_paired: bool,
+    ps_hold_fired: bool,
 }
 
 /// Analog-trigger press threshold (0-255); released rests at 0.
 const TRIG_THRESHOLD: u8 = 0x40;
 
+/// How long PS must be held solo before [ps] hold fires.
+const PS_HOLD_SECS: u64 = 3;
+
 impl ChordState {
-    fn new(bindings: Vec<(String, usize, u8, String)>, notify: config::NotifyConfig) -> Self {
+    fn new(
+        bindings: Vec<(String, usize, u8, String)>,
+        notify: config::NotifyConfig,
+        ps_tap: Option<String>,
+        ps_hold: Option<String>,
+    ) -> Self {
         let n = bindings.len();
         ChordState {
             bindings,
@@ -189,6 +206,12 @@ impl ChordState {
             swallow_hat: false,
             skip_edges: true,
             notify,
+            ps_tap,
+            ps_hold,
+            ps_held: false,
+            ps_held_since: None,
+            ps_paired: false,
+            ps_hold_fired: false,
         }
     }
 
@@ -237,6 +260,53 @@ impl ChordState {
                 self.swallow[2] |= 0x01;
             }
             self.prev_pressed[i] = pressed;
+        }
+        // --- solo PS tap / hold ------------------------------------------
+        // "Paired" = any non-PS input active during the press (chord button
+        // or game input) — cancels both tap and hold. feed() runs on the RAW
+        // report, so a fired chord's button still reads as pressed here.
+        let paired_now = (report[l.btn0] & 0x0f) != 0x08 // d-pad nibble (0x08 = neutral)
+            || report[l.btn0] & 0xf0 != 0 // square/cross/circle/triangle
+            || report[l.btn0 + 1] != 0 // L1/R1/share/options/L3/R3
+            || report[l.btn0 + 2] & !0x01 != 0 // non-PS bits of the PS byte
+            || report.get(l.trig0).is_some_and(|&v| v > TRIG_THRESHOLD)
+            || report.get(l.trig0 + 1).is_some_and(|&v| v > TRIG_THRESHOLD);
+        let now = std::time::Instant::now();
+        if ps_down {
+            if !self.ps_held {
+                self.ps_held = true;
+                self.ps_held_since = Some(now);
+                // conservative on reload: PS already down = unknown history
+                self.ps_paired = self.skip_edges;
+                self.ps_hold_fired = false;
+            }
+            if paired_now {
+                self.ps_paired = true;
+            }
+            if !self.ps_paired
+                && !self.ps_hold_fired
+                && self.ps_hold.is_some()
+                && self.ps_held_since.is_some_and(|s| {
+                    now.duration_since(s) >= std::time::Duration::from_secs(PS_HOLD_SECS)
+                })
+            {
+                self.ps_hold_fired = true;
+                let cmd = self.ps_hold.clone().unwrap();
+                eprintln!("ps-hold → sh -c {cmd:?}");
+                exec_and_notify("ps-hold", &cmd, &self.notify);
+            }
+        } else if self.ps_held {
+            // release edge: a quick solo tap fires [ps] tap
+            if !self.ps_paired && !self.ps_hold_fired {
+                if let Some(cmd) = self.ps_tap.clone() {
+                    eprintln!("ps-tap → sh -c {cmd:?}");
+                    exec_and_notify("ps-tap", &cmd, &self.notify);
+                }
+            }
+            self.ps_held = false;
+            self.ps_held_since = None;
+            self.ps_paired = false;
+            self.ps_hold_fired = false;
         }
         if !ps_down {
             self.swallow = [0; 3];
@@ -528,7 +598,12 @@ pub fn run(opts: ProxyOpts) -> i32 {
     crate::audiobridge::start();
     cleanup_stale_mounts();
     let cfg = config::load();
-    let mut chords = ChordState::new(config::parse_chords(&cfg).list, cfg.notify.clone());
+    let mut chords = ChordState::new(
+        config::parse_chords(&cfg).list,
+        cfg.notify.clone(),
+        cfg.ps.tap_cmd(),
+        cfg.ps.hold_cmd(),
+    );
     let mut ps_swallow = cfg.ps.swallow();
     let mut tone: Option<audio::Tone> = None;
     let mut audio_sink: Option<sink::Sink> = None;
@@ -963,7 +1038,12 @@ fn relay_loop(
         }
         if RELOAD.swap(false, Ordering::Relaxed) {
             let cfg = config::load();
-            *chords = ChordState::new(config::parse_chords(&cfg).list, cfg.notify.clone());
+            *chords = ChordState::new(
+        config::parse_chords(&cfg).list,
+        cfg.notify.clone(),
+        cfg.ps.tap_cmd(),
+        cfg.ps.hold_cmd(),
+    );
             *ps_swallow = cfg.ps.swallow();
             eprintln!(
                 "config reloaded: {} chord(s), ps={}",

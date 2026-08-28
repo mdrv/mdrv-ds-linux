@@ -119,12 +119,35 @@ pub struct PsConfig {
     /// "swallow" — strip the PS bit from relayed reports; only mdrv-ds
     /// chords can see the PS button (allowlist of exactly mdrv-ds).
     pub mode: Option<String>,
+    /// shell command fired on a solo PS tap (press+release without any
+    /// other button). Optional; syntax same as [chords] ("shell:…").
+    pub tap: Option<String>,
+    /// shell command fired when PS is held solo for 3 s. Optional.
+    pub hold: Option<String>,
 }
 
 impl PsConfig {
     pub fn swallow(&self) -> bool {
         self.mode.as_deref() == Some("swallow")
     }
+    /// Normalized solo-tap command ('shell:' prefix stripped), if configured.
+    pub fn tap_cmd(&self) -> Option<String> {
+        ps_solo_cmd("tap", self.tap.as_deref())
+    }
+    /// Normalized solo-hold command ('shell:' prefix stripped), if configured.
+    pub fn hold_cmd(&self) -> Option<String> {
+        ps_solo_cmd("hold", self.hold.as_deref())
+    }
+}
+
+fn ps_solo_cmd(which: &str, action: Option<&str>) -> Option<String> {
+    let action = action?;
+    let cmd = action.strip_prefix("shell:").unwrap_or(action);
+    if cmd.trim().is_empty() {
+        eprintln!("ps: {which}: empty command (skipped)");
+        return None;
+    }
+    Some(cmd.to_string())
 }
 
 pub fn path() -> PathBuf {
