@@ -929,6 +929,11 @@ fn follow_pad_sink(usb: bool) {
                 .stderr(std::process::Stdio::null())
                 .output()
         };
+        // WirePlumber occasionally applies the pad card's profile at boot
+        // but fails to create the sink node (card present, mic source
+        // present, sink missing). Cycling off→pro-audio re-creates it.
+        // Verified live 2026-08-29.
+        let mut cycled = false;
         for _ in 0..10 {
             let Ok(out) = pactl(&["list", "sinks", "short"]) else {
                 std::thread::sleep(Duration::from_secs(1));
@@ -955,6 +960,24 @@ fn follow_pad_sink(usb: bool) {
                     Err(e) => eprintln!("sink: set-default failed: {e}"),
                 }
                 return;
+            }
+            // Sink node missing but card may exist — profile-cycle once.
+            if usb && !cycled {
+                if let Ok(cards) = pactl(&["list", "cards", "short"]) {
+                    let text = String::from_utf8_lossy(&cards.stdout);
+                    if let Some(line) = text.lines().find(|l| {
+                        l.split_whitespace()
+                            .any(|f| f.starts_with("alsa_card.usb-Sony"))
+                    }) {
+                        if let Some(idx) = line.split_whitespace().next() {
+                            cycled = true;
+                            eprintln!("sink: pad card without sink node — cycling profile");
+                            let _ = pactl(&["set-card-profile", idx, "off"]);
+                            std::thread::sleep(Duration::from_millis(800));
+                            let _ = pactl(&["set-card-profile", idx, "pro-audio"]);
+                        }
+                    }
+                }
             }
             std::thread::sleep(Duration::from_secs(1));
         }
@@ -1410,11 +1433,21 @@ fn relay_loop(
                                             fix_bt_feature_crc(&mut data);
                                         }
                                     }
-                                    eprintln!(
-                                        "get_report 0x{rnum:02x} (usb): {}B: {}",
-                                        data.len(),
-                                        hid::hex(&data)
-                                    );
+                                    {
+                                        // Games/wine poll feature reports
+                                        // continuously (~4/s); log the first
+                                        // few replies per process only.
+                                        static N: std::sync::atomic::AtomicU32 =
+                                            std::sync::atomic::AtomicU32::new(0);
+                                        let n = N.fetch_add(1, Ordering::Relaxed);
+                                        if n < 4 || n % 512 == 0 {
+                                            eprintln!(
+                                                "get_report 0x{rnum:02x} (usb): {}B: {}",
+                                                data.len(),
+                                                hid::hex(&data)
+                                            );
+                                        }
+                                    }
                                     let _ = ipc::send(
                                         sock,
                                         ipc::TAG_GET_REPLY,
