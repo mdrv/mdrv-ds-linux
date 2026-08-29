@@ -827,6 +827,15 @@ pub fn run(opts: ProxyOpts) -> i32 {
             let mut poke = [0u8; 48];
             poke[0] = 0x02;
             let _ = real.write_all(&poke);
+            // Re-assert the jack path on (re)connect — the pad forgets it
+            // across power cycles and game outputs hardcode the speaker
+            // path (see the in-flight rewrite in the relay below).
+            let jack = sink::JACK_PLUGGED.load(Ordering::Relaxed);
+            let _ = real.write_all(&sink::usb_engage_report(jack));
+            eprintln!(
+                "jack engage (usb) → {} (connect)",
+                if jack { "headset" } else { "speaker" }
+            );
         }
 
         // Phase-1 BT audio: continuous 440 Hz test tone (config-gated).
@@ -979,9 +988,9 @@ fn follow_pad_sink(usb: bool) {
                             std::thread::sleep(Duration::from_millis(800));
                             let mut ok = false;
                             for prof in [
+                                "pro-audio",
                                 "Default (Headphones, Mic)",
                                 "Default (Mic, Speaker)",
-                                "pro-audio",
                             ] {
                                 if pactl(&["set-card-profile", idx, prof]).is_ok() {
                                     ok = true;
@@ -1189,8 +1198,17 @@ fn relay_loop(
                     // raw[52..53]/[58..61] are counters/CRC noise. Hysteresis
                     // (see decl above): integrator arms plug at 16 net
                     // highs; 800 ms with zero highs unlatches.
-                    if report.len() > 55 && report[0] == 0x31 {
-                        let raw = report[55] & 0x01 != 0;
+                    let jack_byte = if report.len() > 55 && report[0] == 0x31 {
+                        Some(report[55])
+                    } else if report.len() > 54 && report[0] == 0x01 {
+                        // USB input 0x01: HP-detect at byte 54 bit0 (vds
+                        // kUsbInputHeadsetOffset=54 counts the report id).
+                        Some(report[54])
+                    } else {
+                        None
+                    };
+                    if let Some(jb) = jack_byte {
+                        let raw = jb & 0x01 != 0;
                         let before = jack_latched;
                         if raw {
                             jack_int = (jack_int + 1).min(16);
@@ -1208,8 +1226,23 @@ fn relay_loop(
                             }
                         }
                         if jack_latched != before {
-                            eprintln!("jack: latch -> {} (b55 {:#04x})", jack_latched, report[55]);
+                            eprintln!("jack: latch -> {} (byte {:#04x})", jack_latched, jb);
                             notify_jack(jack_latched);
+                            if !l2cap {
+                                // USB engage: the same mic-state bytes as
+                                // the BT 0x31 engage, framed as a 48 B 0x02
+                                // output report on the pad's hidraw.
+                                if let Err(e) =
+                                    real.write_all(&sink::usb_engage_report(jack_latched))
+                                {
+                                    eprintln!("jack engage (usb) write: {e}");
+                                } else {
+                                    eprintln!(
+                                        "jack engage (usb) → {}",
+                                        if jack_latched { "headset" } else { "speaker" }
+                                    );
+                                }
+                            }
                         }
                         sink::JACK_PLUGGED.store(jack_latched, Ordering::Relaxed);
                     }
@@ -1349,8 +1382,23 @@ fn relay_loop(
                             data.len(),
                             hid::hex(&data[..data.len().min(8)])
                         );
-                    } else if let Err(e) = real.write_all(&data) {
-                        eprintln!("hidraw write output: {e}");
+                    } else {
+                        // USB relay: keep the engaged jack path sticky —
+                        // game/wine audio-control writes hardcode the
+                        // speaker path (captured: flag0 0x8d, [7]=0x30).
+                        // On BT the sink re-merges the path on every 0x36;
+                        // on USB rewrite the path nibble in flight.
+                        let mut data = data;
+                        if info.transport == Transport::Usb
+                            && data.len() == 48
+                            && data.first() == Some(&0x02)
+                        {
+                            let jack = sink::JACK_PLUGGED.load(Ordering::Relaxed);
+                            data[7] = (data[7] & !0x30) | if jack { 0x00 } else { 0x30 };
+                        }
+                        if let Err(e) = real.write_all(&data) {
+                            eprintln!("hidraw write output: {e}");
+                        }
                     }
                 }
                 Ok((ipc::TAG_GET_REQ, p)) => {

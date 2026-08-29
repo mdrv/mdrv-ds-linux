@@ -149,6 +149,34 @@ fn put_crc(report: &mut [u8]) {
     report[n - 4..n].copy_from_slice(&crc.to_le_bytes());
 }
 
+/// USB jack engage: a full 48 B USB output report (id 0x02 + 47 B state,
+/// no seq/CRC — captured kernel USB outputs' tails are zeros). The plain
+/// mic-state engage left the HP amp unconfigured; this mirrors vds
+/// `set_audio_out_stream_active()` on top of the proven STATE_INIT base:
+/// jack path enables the headphone volume and zeroes/disables the speaker,
+/// speaker path the reverse.
+pub fn usb_engage_report(jack_path: bool) -> [u8; 48] {
+    let mut rpt = [0u8; 48];
+    rpt[0] = 0x02;
+    rpt[1..48].copy_from_slice(&STATE_INIT);
+    let s = &mut rpt[1..48];
+    if jack_path {
+        s[0] = (s[0] | 0x10) & !0x20; // HP vol on, SPEAKER vol off
+        s[1] &= !0x80; // audio-control-2 off
+        s[4] = 0x7F; // headphone volume
+        s[5] = 0x00; // speaker muted
+        s[7] = (s[7] & !0x30) | 0x00; // path: headphones
+        s[37] = 0x00;
+    } else {
+        s[0] = (s[0] | 0x20) & !0x10; // SPEAKER vol on, HP vol off
+        s[1] |= 0x80; // audio-control-2 on
+        s[5] = 0x64; // speaker volume
+        s[7] = (s[7] & !0x30) | 0x30; // path: speaker
+        s[37] = 0x01;
+    }
+    rpt
+}
+
 /// 0x31 volume unlock (valid_flag0 bit4 = AllowHeadphoneVolume is required
 /// or the jack stays silent on PC-only-paired pads).
 /// vds-proven initial 47-byte `dualsense_output_report_common` state:
@@ -365,7 +393,6 @@ pub fn start(
     handles.push(thread::spawn(move || {
         pw_thread(pw_shared, pw_stop, pw_quit, pw_desc)
     }));
-
 
     let fd = unsafe { libc::dup(real.as_raw_fd()) };
     let mut file = unsafe { File::from_raw_fd(fd) };
@@ -588,9 +615,6 @@ fn pw_thread(
     mainloop.run();
     eprintln!("sink: mainloop exited");
 }
-
-
-
 
 // ---- writer thread ---------------------------------------------------------
 
@@ -1116,7 +1140,6 @@ fn writer_thread(
         }
         in_buf.drain(..consumed_pairs * 4);
         in_pos -= consumed_pairs as f64;
-
 
         // Haptics-only: no Opus TLV, no audio path selection — just the
         // 0x12 PCM frame in a minimal 0x32 report.
