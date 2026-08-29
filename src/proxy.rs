@@ -931,8 +931,11 @@ fn follow_pad_sink(usb: bool) {
         };
         // WirePlumber occasionally applies the pad card's profile at boot
         // but fails to create the sink node (card present, mic source
-        // present, sink missing). Cycling off→pro-audio re-creates it.
-        // Verified live 2026-08-29.
+        // present, sink missing). Cycling off→profile re-creates it.
+        // Verified live 2026-08-29. Prefer the jack-aware "Default"
+        // profiles (ports + split FL/FR → 3.5mm, stereo-friendly streams)
+        // over raw pro-audio (4ch, no port routing, no jack audio, and
+        // games copy the 4ch layout so later sink moves can fail).
         let mut cycled = false;
         for _ in 0..10 {
             let Ok(out) = pactl(&["list", "sinks", "short"]) else {
@@ -974,7 +977,21 @@ fn follow_pad_sink(usb: bool) {
                             eprintln!("sink: pad card without sink node — cycling profile");
                             let _ = pactl(&["set-card-profile", idx, "off"]);
                             std::thread::sleep(Duration::from_millis(800));
-                            let _ = pactl(&["set-card-profile", idx, "pro-audio"]);
+                            let mut ok = false;
+                            for prof in [
+                                "Default (Headphones, Mic)",
+                                "Default (Mic, Speaker)",
+                                "pro-audio",
+                            ] {
+                                if pactl(&["set-card-profile", idx, prof]).is_ok() {
+                                    ok = true;
+                                    eprintln!("sink: profile cycle → {prof}");
+                                    break;
+                                }
+                            }
+                            if !ok {
+                                eprintln!("sink: profile cycle failed");
+                            }
                         }
                     }
                 }
