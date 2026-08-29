@@ -18,7 +18,7 @@
 #   * mdrv-ds proxy/holder stay untouched (compositor-independent).
 #   * The four Wayland-bound daemons (audio, settings, launcher, notify)
 #     are stopped as systemd units and restarted INSIDE the session on
-#     WAYLAND_DISPLAY=gamescope-0 (layer-shell overlays + toasts).
+#     WAYLAND_DISPLAY=gamescope-0; suite UI (launcher + overlay) as X11.
 #   * On exit the systemd units are restored only while Hyprland is alive
 #     (they would crash-loop against a missing wayland-1 otherwise).
 #
@@ -205,9 +205,13 @@ BG_WINDOW='
   fi
 '
 START_D() {
-  # The OVERLAY is the single layer-shell client (gamescope composites
-  # exactly ONE layer surface — the popups+toasts live in that one
-  # surface now; the launcher runs as X11). DISABLE_GAMESCOPE_WSI
+  # LAUNCHER and OVERLAY both run as normal X11 windows: gamescope's
+  # wlserver is fragile with layer clients (single composite slot,
+  # executor freeze when un-composited, wlserver SEGFAULT on activation
+  # commits — 2026-08-29 sessions). As toplevels they coexist with the
+  # game; the overlay shows by activate_window, hides by minimize.
+  # COST: no floating toasts over games in gamescope sessions (an X11
+  # toast window would itself become the fullscreen primary). DISABLE_GAMESCOPE_WSI
   # stays SET for the suite too: with the layer active, gpui/blade's
   # swapchain recreate on first configure hits "wlserver: create_swapchain:
   # Surface already had a gamescope_swapchain" and the surface never
@@ -219,7 +223,7 @@ START_D() {
   echo "
   for d in $*; do
     echo \"[suite] starting mdrv-ds-\$d on gamescope-0\"
-    if [ \"\$d\" = launcher ]; then
+    if [ \"\$d\" = launcher ] || [ \"\$d\" = overlay ]; then
       env -u WAYLAND_DISPLAY DISPLAY=:0 /g/mdrv-ds-\$d/target/release/mdrv-ds-\$d daemon start --foreground >>\"\$GSLOG\" 2>&1 &
     else
       /g/mdrv-ds-\$d/target/release/mdrv-ds-\$d daemon start --foreground >>\"\$GSLOG\" 2>&1 &
