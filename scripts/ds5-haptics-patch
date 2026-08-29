@@ -113,7 +113,7 @@ PROFILES = {
              "lib/wine/x86_64-unix/winepulse.so",
         raw=True,
         sites=[
-            (0x7240,
+            (0xc1e0,
              "554889e541574156415541544989fc534881ec2810",
              "48b84c05e60c0000ffff48bac0ffee0ce6054c00c3"),
             # pulse_stream_connect_timeout: when a specific device was
@@ -121,7 +121,7 @@ PROFILES = {
             # which pipewire-pulse maps to node.dont-reconnect -> all
             # pactl/pavucontrol moves of game streams fail with EINVAL.
             # 0x12201 (base|DONT_MOVE) -> 0x12001 (base). One byte: 0x22->0x20.
-            (0x7e3c,
+            (0x888c,
              "22",
              "20"),
         ],
@@ -133,15 +133,15 @@ PROFILES = {
         raw=True,
         sites=[
             # make_unique_container_id store sequence -> constant GUID
-            (0x1ab2,
-             "0fb74644488d4dd8c1e21009d00fb796a00600008986900600000fb7"
-             "4650c1e01009d0898694060000ff157fc80000488b45d84889869806"
+            (0x1b32,
+             "0fb74644488d4dd8c1e21009d00fb796a40600008986940600000fb7"
+             "4650c1e01009d0898698060000ff1507e80000488b45d84889869c06"
              "0000",
-             "c786900600004c05e60cc786940600000000ffff48b8c0ffee0ce605"
-             "4c004889869806000090909090909090909090909090909090909090"
-             "9090"),
+             "c786940600004c05e60cc786980600000000ffff48b8c0ffee0ce605"
+             "4c004889869c06000090909090909090909090909090909090909090"
+             "90909090909090909090909090909090909090"),
             # bus_type_str[] entry: UTF-16LE "BTHENUM" -> "USB" + NUL padding
-            (0xa364,
+            (0xb6ac,
              "42005400480045004e0055004d000000",
              "55005300420000000000000000000000"),
         ],
