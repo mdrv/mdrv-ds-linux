@@ -16,9 +16,10 @@
 #
 # What runs where:
 #   * mdrv-ds proxy/holder stay untouched (compositor-independent).
-#   * The four Wayland-bound daemons (audio, settings, launcher, notify)
-#     are stopped as systemd units and restarted INSIDE the session on
-#     WAYLAND_DISPLAY=gamescope-0; suite UI (launcher + overlay) as X11.
+#   * The suite daemons are stopped as systemd units and restarted INSIDE
+#     the session; the overlay binds WAYLAND_DISPLAY=gamescope-0 (layer)
+#     while the launcher runs as an X11 primary whose repaint heartbeat
+#     keeps gamescope compositing (gamescope#95/#441 workaround).
 #   * On exit the systemd units are restored only while Hyprland is alive
 #     (they would crash-loop against a missing wayland-1 otherwise).
 #
@@ -205,25 +206,26 @@ BG_WINDOW='
   fi
 '
 START_D() {
-  # LAUNCHER and OVERLAY both run as normal X11 windows: gamescope's
-  # wlserver is fragile with layer clients (single composite slot,
-  # executor freeze when un-composited, wlserver SEGFAULT on activation
-  # commits — 2026-08-29 sessions). As toplevels they coexist with the
-  # game; the overlay shows by activate_window, hides by minimize.
-  # COST: no floating toasts over games in gamescope sessions (an X11
-  # toast window would itself become the fullscreen primary). DISABLE_GAMESCOPE_WSI
-  # stays SET for the suite too: with the layer active, gpui/blade's
-  # swapchain recreate on first configure hits "wlserver: create_swapchain:
-  # Surface already had a gamescope_swapchain" and the surface never
-  # presents (black screen, 2026-08-28). The disabled path works, just
-  # slower (~15 FPS). The LAUNCHER (if in the list) runs as a normal X11
-  # window instead — wlserver composites only ONE layer surface at a time,
-  # so as a layer it would hide the popups (or be hidden by them); as an
-  # XWayland toplevel it coexists with the popups exactly like a game.
+  # LAUNCHER runs as a normal X11 window; OVERLAY returns to the layer.
+  # Rationale (2026-08-29 live rounds + upstream issues):
+  #  * gamescope composites a layer surface ONLY while the primary plane
+  #    animates (gamescope#95), and withholds frame callbacks from idle
+  #    clients (gamescope#441) — a frozen overlay executor is a symptom,
+  #    not the disease.
+  #  * The LAUNCHER, as the idle-session X11 primary, now runs a repaint
+  #    heartbeat (near-invisible opacity breathing every frame), which
+  #    keeps gamescope repainting — frame callbacks flow and the overlay
+  #    layer above it stays composited and interactive.
+  #  * wlserver still composites only ONE layer surface at a time, so the
+  #    overlay being the sole layer client is by design; toasts render in
+  #    that same surface.
+  # DISABLE_GAMESCOPE_WSI stays SET for the suite: gpui/blade swapchain
+  # recreate on first configure hits "wlserver: create_swapchain: Surface
+  # already had a gamescope_swapchain" and never presents (2026-08-28).
   echo "
   for d in $*; do
     echo \"[suite] starting mdrv-ds-\$d on gamescope-0\"
-    if [ \"\$d\" = launcher ] || [ \"\$d\" = overlay ]; then
+    if [ \"\$d\" = launcher ]; then
       env -u WAYLAND_DISPLAY DISPLAY=:0 /g/mdrv-ds-\$d/target/release/mdrv-ds-\$d daemon start --foreground >>\"\$GSLOG\" 2>&1 &
     else
       /g/mdrv-ds-\$d/target/release/mdrv-ds-\$d daemon start --foreground >>\"\$GSLOG\" 2>&1 &
