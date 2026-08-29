@@ -116,6 +116,14 @@ PROFILES = {
             (0x7240,
              "554889e541574156415541544989fc534881ec2810",
              "48b84c05e60c0000ffff48bac0ffee0ce6054c00c3"),
+            # pulse_stream_connect_timeout: when a specific device was
+            # requested wine sets flags |= PA_STREAM_DONT_MOVE (0x200),
+            # which pipewire-pulse maps to node.dont-reconnect -> all
+            # pactl/pavucontrol moves of game streams fail with EINVAL.
+            # 0x12201 (base|DONT_MOVE) -> 0x12001 (base). One byte: 0x22->0x20.
+            (0x7e3c,
+             "22",
+             "20"),
         ],
         doc="get_container_id stub -> constant DualSense container GUID",
     ),
