@@ -177,6 +177,27 @@ pub fn usb_engage_report(jack_path: bool) -> [u8; 48] {
     rpt
 }
 
+/// Minimal USB re-assert heartbeat: only the audio-config bits — flag0
+/// enables + volumes + path — so interleaved game rumble/trigger reports
+/// are never stomped. Sent every 2 s by the USB relay because the pad
+/// drops audio-config state when its UAC stream re-opens (alt-setting
+/// change), e.g. at game launch.
+pub fn usb_reassert_report(jack_path: bool) -> [u8; 48] {
+    let mut rpt = [0u8; 48];
+    rpt[0] = 0x02;
+    let s = &mut rpt[1..48];
+    if jack_path {
+        s[0] = 0x80 | 0x10; // audioctl + HP volume enable
+        s[4] = 0x7F; // headphone volume
+        s[7] = 0x09; // path: headphones
+    } else {
+        s[0] = 0x80 | 0x20; // audioctl + speaker volume enable
+        s[5] = 0x64; // speaker volume
+        s[7] = 0x39; // path: speaker
+    }
+    rpt
+}
+
 /// 0x31 volume unlock (valid_flag0 bit4 = AllowHeadphoneVolume is required
 /// or the jack stays silent on PC-only-paired pads).
 /// vds-proven initial 47-byte `dualsense_output_report_common` state:

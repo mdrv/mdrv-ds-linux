@@ -1119,6 +1119,11 @@ fn relay_loop(
     // frames can't reach it), disengage only after 800 ms with ZERO
     // high frames (flutter can never trip it).
     let mut jack_int: u32 = 0;
+    // USB: periodic jack-path re-assert. The pad can drop audio-config
+    // state when the UAC stream re-opens (alt-setting change); BT re-
+    // asserts per 0x36, USB needs this heartbeat (audio-config bits
+    // only — never touches rumble/trigger bytes).
+    let mut usb_reassert_at = std::time::Instant::now();
     let mut jack_raw_since = now0;
     let mut jack_latched = false;
 
@@ -1245,6 +1250,14 @@ fn relay_loop(
                             }
                         }
                         sink::JACK_PLUGGED.store(jack_latched, Ordering::Relaxed);
+                    }
+                    if !l2cap
+                        && now.duration_since(usb_reassert_at)
+                            >= std::time::Duration::from_millis(2000)
+                    {
+                        usb_reassert_at = now;
+                        let jack = sink::JACK_PLUGGED.load(Ordering::Relaxed);
+                        let _ = real.write_all(&sink::usb_reassert_report(jack));
                     }
                     // L2CAP native passthrough: the virtual pad carries the
                     // BT descriptor, so control frames relay verbatim in
@@ -1391,6 +1404,15 @@ fn relay_loop(
                         let mut data = data;
                         if info.transport == Transport::Usb
                             && data.len() == 48
+                            && data.first() == Some(&0x02)
+                        {
+                            let jack = sink::JACK_PLUGGED.load(Ordering::Relaxed);
+                            data[7] = (data[7] & !0x30) | if jack { 0x00 } else { 0x30 };
+                        }
+                        // 63 B 0x02 outputs (Edge-shaped) share the common
+                        // block at [1..]; rewrite their path nibble too.
+                        if info.transport == Transport::Usb
+                            && data.len() == 63
                             && data.first() == Some(&0x02)
                         {
                             let jack = sink::JACK_PLUGGED.load(Ordering::Relaxed);
