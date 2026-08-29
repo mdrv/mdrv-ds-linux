@@ -50,9 +50,11 @@ SERVICES=(mdrv-ds-overlay.service mdrv-ds-launcher.service)
 
 # Kill transient suite instances + clear their toggle sockets. Pattern is
 # exact enough to never match the mdrv-ds proxy/holder ("…/mdrv-ds holder").
+# The audio/settings/notify sockets are the overlay daemon's compat
+# listeners — they go stale with it and would mislead the thin clients.
 suite_pkill() {
   pkill -f '/target/release/mdrv-ds-(overlay|launcher)' 2>/dev/null
-  for n in overlay launcher; do
+  for n in overlay launcher audio settings notify; do
     rm -f "$XDG_RUNTIME_DIR/mdrv-ds-$n.sock"
   done
 }
@@ -266,8 +268,8 @@ fi
 log "starting gamescope (drm, 1080p60); session root: $ROOT"
 : > "$GSLOG"
 export GSLOG
-gamescope --expose-wayland --backend=drm \
-  -W 1920 -H 1080 -w 1920 -h 1080 -r 60 -f -- \
+gamescope --expose-wayland --backend=drm --immediate-flips \
+  -W 1920 -H 1080 -w 1920 -h 1080 -r 60 -b -- \
   bash -c "$INNER" bash "$@" \
   >>"$GSLOG" 2>&1 &
 GS=$!
