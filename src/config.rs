@@ -21,6 +21,23 @@ pub struct Config {
     /// --noplugin=input; requires scripts/bt-input-off.sh + setcap).
     #[serde(default)]
     pub transport: Option<String>,
+    /// Present the virtual pad on a different bus than the physical link:
+    /// "usb" makes an L2CAP (Bluetooth) DualSense session create the virtual
+    /// pad as bus=USB with the USB report descriptor, translates BT input
+    /// frames to USB input reports and game USB outputs back to BT — for
+    /// games (RE Engine: PRAGMATA) that gate adaptive triggers/haptics on
+    /// "pad is Bluetooth". None/"bluetooth" = native presentation (default;
+    /// FF16 requires this). Applies to DualSense L2CAP sessions only; takes
+    /// effect on the next pad session.
+    #[serde(default)]
+    pub force_bus: Option<String>,
+    /// Swap the cross (X) and circle (O) face buttons on the virtual pad —
+    /// JP-style confirm (O confirms) on games that use the western layout.
+    /// Applied in the relay before ANY consumer sees the report (game HID
+    /// reads, kernel evdev, chords), so games visibly respond to the
+    /// swapped button. DualSense chimera sessions only; default false.
+    #[serde(default)]
+    pub swap_cross_circle: Option<bool>,
     #[serde(default)]
     pub chords: HashMap<String, String>,
     #[serde(default)]
@@ -36,6 +53,22 @@ pub struct Config {
 impl Config {
     pub fn l2cap(&self) -> bool {
         self.transport.as_deref() == Some("l2cap")
+    }
+
+    /// True when force_bus asks for a USB-presented virtual pad.
+    /// Unknown values are rejected with a warning (native presentation).
+    pub fn force_usb(&self) -> bool {
+        match self.force_bus.as_deref() {
+            Some(v) => match v {
+                "usb" => true,
+                "bluetooth" | "" => false,
+                other => {
+                    eprintln!("config: force_bus: unknown value {other:?} (want \"usb\" or \"bluetooth\") — ignoring");
+                    false
+                }
+            },
+            None => false,
+        }
     }
 }
 
@@ -103,7 +136,8 @@ pub struct AudioConfig {
     /// are relayed directly) or "0x36" (vds-style combined state+haptics+
     /// audio reports — proven only over direct L2CAP). Default "0x35".
     pub report: Option<String>,
-    /// pavucontrol label for the sink (default "DualSense Wireless Controller (BT)"; games match on the DualSense substring for haptic-audio routing).
+    /// pavucontrol label for the sink (default "Wireless Controller" — Sony's real
+    /// UAC name on Windows/USB; RE Engine matches on it for haptics).
     pub node_description: Option<String>,
     /// Writer pacing interval in microseconds (default 10667 = 480/45000).
     /// The dsneo spec shows 200 ppm session-specific clock variance between
@@ -114,6 +148,15 @@ pub struct AudioConfig {
     /// code path. Diagnostic: isolates whether the sink's writer detour
     /// (queue + unified-seq restamp) causes rumble micro-stutter.
     pub sink: Option<bool>,
+    /// Where the pad-stream's front (music) channels go: "pad" (default —
+    /// Opus to the pad speaker), "forward" (play them on the normal system
+    /// output instead; pad speaker silent, haptics unaffected — rerouting in
+    /// pavucontrol kills rumble, this doesn't) or "mute" (drop them).
+    /// Haptics (rear channels) always ride the pad link.
+    pub speaker_output: Option<String>,
+    /// PipeWire node.name to play on when speaker_output="forward"
+    /// (absent → system default output).
+    pub speaker_target: Option<String>,
 }
 
 /// `[notify]` table — event callback for chord fires. The command runs via

@@ -692,9 +692,24 @@ pub fn run(opts: ProxyOpts) -> i32 {
         let virtual_uniq = derive_virtual_mac(&info.uniq);
         let virtual_mac: [u8; 6] =
             parse_mac(&virtual_uniq).unwrap_or([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01]);
-        // Chords/gating speak the transport's native layout — the virtual
-        // pad presents it natively in both modes.
-        let layout = layout_for(info.transport);
+        // USB-chimera view (force_bus = "usb"): present the virtual pad as
+        // bus=USB with the real USB rdesc even though the physical link is
+        // BT — RE Engine (PRAGMATA) gates adaptive triggers/haptics on "pad
+        // is Bluetooth". The relay translates BT input frames to USB input
+        // reports and USB-shaped outputs/feature reports back to BT. DS5
+        // only; FF16 needs the native BT presentation, which stays the
+        // default.
+        let usb_view = ctrl.is_some() && info.product != crate::hid::PRODUCT_DS4 && cfg.force_usb();
+        if usb_view {
+            eprintln!("usb view: virtual pad presents USB over the BT link (force_bus=\"usb\")");
+        }
+        // Chords/gating speak the layout the virtual pad presents natively
+        // in both modes (USB-shaped when the chimera view is on).
+        let layout = layout_for(if usb_view {
+            Transport::Usb
+        } else {
+            info.transport
+        });
 
         // The virtual pad lives in the holder daemon (see holder.rs) and
         // survives proxy restarts — games hold its nodes and never
@@ -713,10 +728,17 @@ pub fn run(opts: ProxyOpts) -> i32 {
             // BT-native presentation: FF16 accepts input ONLY from a pad that
             // is genuinely Bluetooth end-to-end (bus=BLUETOOTH + BT rdesc +
             // 0x31 frames). A USB-ancestry chimera was rejected by both the
-            // input path and the haptics gate (tested 19:41 build).
-            bus: match info.transport {
-                crate::hid::Transport::Usb => uhid::BUS_USB,
-                _ => uhid::BUS_BLUETOOTH,
+            // input path and the haptics gate (tested 19:41 build). PRAGMATA
+            // is the opposite case: force_bus = "usb" opts INTO the chimera
+            // (usb_view above) — bus=USB + real USB rdesc + translated 0x01
+            // input reports, i.e. exactly the cabled pad this game accepts.
+            bus: if usb_view {
+                uhid::BUS_USB
+            } else {
+                match info.transport {
+                    crate::hid::Transport::Usb => uhid::BUS_USB,
+                    _ => uhid::BUS_BLUETOOTH,
+                }
             },
             vendor: DS_VENDOR,
             product: info.product,
@@ -729,7 +751,11 @@ pub fn run(opts: ProxyOpts) -> i32 {
                 "DualSense Wireless Controller".to_string()
             },
             uniq: virtual_uniq.clone(),
-            rdesc: info.rdesc.clone(),
+            rdesc: if usb_view {
+                l2cap::DS5_HID_REPORT_DESCRIPTOR.to_vec()
+            } else {
+                info.rdesc.clone()
+            },
         };
         if ipc::send(&mut sock, ipc::TAG_CREATE, &ipc::encode_create(&msg)).is_err() {
             eprintln!("holder: create send failed; retrying");
@@ -880,6 +906,8 @@ pub fn run(opts: ProxyOpts) -> i32 {
             &mut ps_swallow,
             &mut stick_dz,
             session_is_l2cap,
+            usb_view,
+            cfg.swap_cross_circle.unwrap_or(false),
             l2cap_features.as_mut(),
         );
         eprintln!("teardown: relay loop returned (pad fd closed or exit requested)");
@@ -962,9 +990,14 @@ fn follow_pad_sink(usb: bool) {
                     .then(|| name.to_string())
                 })
             } else {
+                // BT sink name since Fix A: the real cabled pad's UAC
+                // impersonation (see sink.rs PAD_SINK_NODE — PRAGMATA's
+                // libScePad exact-matches "Wireless Controller").
+                const PAD_SINK: &str = "alsa_output.usb-Sony_Interactive_Entertainment_DualSense_Wireless_Controller-00.Default__Speaker__sink";
                 sinks
-                    .contains("mdrv-ds.dualsense-bt")
-                    .then(|| "mdrv-ds.dualsense-bt".to_string())
+                    .lines()
+                    .any(|l| l.split_whitespace().nth(1) == Some(PAD_SINK))
+                    .then(|| PAD_SINK.to_string())
             };
             if let Some(name) = target {
                 match pactl(&["set-default-sink", &name]) {
@@ -1067,11 +1100,15 @@ fn relay_loop(
     ps_swallow: &mut bool,
     stick_dz: &mut crate::config::InputConfig,
     l2cap: bool,
+    usb_view: bool,
+    swap_ox: bool,
     mut features: Option<&mut std::collections::HashMap<u8, Vec<u8>>>,
 ) -> i32 {
     // The virtual pad carries the transport's NATIVE descriptor on L2CAP
     // (BT presentation — see run()), so everything downstream speaks the
     // transport's layout; a DualShock 4 L2CAP session speaks 0x11 instead.
+    // usb_view (force_bus="usb"): it carries the USB descriptor instead and
+    // input is translated to USB 0x01 reports before this layout applies.
     let ds4 = l2cap && info.product == crate::hid::PRODUCT_DS4;
     let layout = if ds4 {
         InputLayout {
@@ -1081,7 +1118,11 @@ fn relay_loop(
             report_id: 0x11,
         }
     } else {
-        layout_for(info.transport)
+        layout_for(if usb_view {
+            Transport::Usb
+        } else {
+            info.transport
+        })
     };
     let flens = hid::feature_lengths(&info.rdesc);
     let real_fd = real.as_raw_fd();
@@ -1110,6 +1151,15 @@ fn relay_loop(
             .map(|f| (f, 0usize))
     });
     let mut eofs: u32 = 0;
+    // Output-log dedup: kernel state workers resend identical 0x02 output
+    // reports in high-frequency bursts (mute-LED worker: ~25/s observed).
+    // Log each distinct payload once and report the repeat count when it
+    // changes — forwarding is unaffected.
+    let mut last_out: Vec<u8> = Vec::new();
+    let mut out_reps: u32 = 0;
+    // Synthetic USB sequence counter for the chimera view (see translation
+    // below): real cabled DualSense pads roll [7] every input report.
+    let mut usb_seq: u8 = 0;
     // Jack-detect debounce (integrator): the HP-detect byte (input 0x31
     // byte 56) is noisy — while PLUGGED the bit is high-dominant but
     // flutters low (byte jumps 0x01/0x65/0x11/0x64), and around an
@@ -1275,6 +1325,50 @@ fn relay_loop(
                             continue;
                         }
                     }
+                    // Chimera view: translate BT 0x31 input frames into USB
+                    // 0x01 input reports. The payloads are offset-aligned
+                    // (usb[i+1] = bt[i+2] for the 63-byte state), so this is
+                    // a header/seq/CRC re-frame, not a field remap.
+                    if usb_view && report.first() == Some(&0x31) && report.len() >= 65 {
+                        let mut usb = Vec::with_capacity(64);
+                        usb.push(0x01);
+                        usb.extend_from_slice(&report[2..65]);
+                        // USB input reports carry an incrementing sequence
+                        // counter at [7]; BT frames park that slot at 1 (BT
+                        // sequences via the L2CAP header byte instead). Games
+                        // (RE Engine/PRAGMATA) treat a frozen counter as a
+                        // silent pad and drop all input — synthesize it.
+                        usb_seq = usb_seq.wrapping_add(1);
+                        usb[7] = usb_seq;
+                        // USB-view fidelity: a few fields in the pad's BT
+                        // frames tell transport truths that contradict the
+                        // USB costume (kernel hid-playstation.c layout):
+                        //  - touch points carry stale bytes while inactive
+                        //    (contact low bits + coordinates); cabled pads
+                        //    report an idle point as 80 00 00 00.
+                        //  - reserved3[0] ([0x29]) streams 0xff on BT, 0x00
+                        //    when cabled.
+                        //  - status[1] ([0x36]) bit3 marks external power:
+                        //    only set when cabled. RE Engine reads it — a USB
+                        //    pad claiming battery power is rejected.
+                        for point in [0x21usize, 0x25] {
+                            if usb[point] & 0x80 != 0 {
+                                usb[point..point + 4].copy_from_slice(&[0x80, 0, 0, 0]);
+                            }
+                        }
+                        usb[0x29] = 0;
+                        usb[0x36] |= 0x08;
+                        // O/X swap: buttons[0] bit5 = cross, bit6 = circle
+                        // (kernel hid-playstation layout; USB[8] = buttons[0]).
+                        // Runs before every consumer — game HID reads, kernel
+                        // evdev, chords — so the game visibly confirms with
+                        // the swapped button.
+                        if swap_ox {
+                            let b = usb[8];
+                            usb[8] = (b & !0x60) | ((b & 0x20) << 1) | ((b & 0x40) >> 1);
+                        }
+                        report = usb;
+                    }
                     // chords fire on the raw report (work even while the
                     // gate is active); fired bits are swallowed below
                     if let Some(tname) = chords.feed(&report, &layout) {
@@ -1348,8 +1442,19 @@ fn relay_loop(
         if fds[1].revents & libc::POLLIN != 0 {
             match ipc::recv(sock) {
                 Ok((ipc::TAG_OUTPUT, data)) => {
-                    if !data.is_empty() {
-                        eprintln!("out ({}B): {}", data.len(), hid::hex(&data));
+                    // Dedup: see last_out/out_reps decl above.
+                    if data != last_out {
+                        if out_reps > 1 {
+                            eprintln!("out: last identical report ×{out_reps}");
+                        }
+                        if !data.is_empty() {
+                            eprintln!("out ({}B): {}", data.len(), hid::hex(&data));
+                        }
+                        last_out.clear();
+                        last_out.extend_from_slice(&data);
+                        out_reps = 1;
+                    } else {
+                        out_reps += 1;
                     }
                     // On BT with the audio sink running, hand kernel output
                     // reports to the sink writer so ALL interrupt-channel
@@ -1385,9 +1490,15 @@ fn relay_loop(
                     // of the merged rdesc). Accept ≥48 B 0x02 shapes; the
                     // sink extracts the 47 B state from either shape.
                     let usb_state = l2cap && data.len() >= 48 && data.first() == Some(&0x02);
+                    // Game trigger-effect reports (USB 0x05, same 47 B state
+                    // layout as 0x02): decode through the sink writer too —
+                    // the pad applies each section gated by its enable flags,
+                    // so a 0x05 only touches the trigger-FFB section of the
+                    // BT 0x31 state.
+                    let usb_trigger = l2cap && data.len() == 48 && data.first() == Some(&0x05);
                     if bt_state && sink::enqueue_output(&data) {
                         // sent via the sink writer
-                    } else if usb_state && sink::enqueue_output(&data[..48]) {
+                    } else if (usb_state || usb_trigger) && sink::enqueue_output(&data[..48]) {
                         // sent via the sink writer
                     } else if l2cap {
                         eprintln!(
@@ -1447,12 +1558,24 @@ fn relay_loop(
                                 for i in 0..6 {
                                     data[1 + i] = virtual_mac[5 - i];
                                 }
-                                // MAC rewrite invalidates the trailing CRC —
-                                // restamp (kernel seed-0xA3 form).
-                                fix_bt_feature_crc_kernel(&mut data);
+                                if !usb_view {
+                                    // MAC rewrite invalidates the trailing
+                                    // CRC — restamp (kernel seed-0xA3 form).
+                                    fix_bt_feature_crc_kernel(&mut data);
+                                }
+                            }
+                            if usb_view && data.len() > 4 {
+                                // USB feature reports have no CRC trailer. The
+                                // BT reply is the SAME total length with the
+                                // last 4 payload bytes replaced by CRC (the
+                                // missing tail is zero padding on the real USB
+                                // pad) — zero it back, keep the length.
+                                let n = data.len();
+                                data[n - 4..].fill(0);
                             }
                             eprintln!(
-                                "get_report 0x{rnum:02x} (bt): {}B: {}",
+                                "get_report 0x{rnum:02x} ({}): {}B: {}",
+                                if usb_view { "usb" } else { "bt" },
                                 data.len(),
                                 hid::hex(&data)
                             );
@@ -1474,9 +1597,18 @@ fn relay_loop(
                                         for i in 0..6 {
                                             data[1 + i] = virtual_mac[5 - i];
                                         }
-                                        // MAC rewrite invalidates the trailing
-                                        // CRC — restamp (kernel seed-0xA3 form).
-                                        fix_bt_feature_crc_kernel(&mut data);
+                                        if !usb_view {
+                                            // MAC rewrite invalidates the
+                                            // trailing CRC — restamp (kernel
+                                            // seed-0xA3 form).
+                                            fix_bt_feature_crc_kernel(&mut data);
+                                        }
+                                    }
+                                    if usb_view && data.len() > 4 {
+                                        // Same-total USB shape: zero the CRC
+                                        // trailer, keep the length.
+                                        let n = data.len();
+                                        data[n - 4..].fill(0);
                                     }
                                     let _ = ipc::send(
                                         sock,
@@ -1603,6 +1735,10 @@ fn relay_loop(
                                 0
                             } else {
                                 let mut body = data.clone();
+                                // BT form keeps the SAME total length as the
+                                // USB shape: stamp the host→pad CRC over the
+                                // last 4 bytes in place (for USB-shaped SETs
+                                // this replaces zero payload tail bytes).
                                 fix_bt_feature_crc(&mut body);
                                 let sent = match ctrl.as_mut() {
                                     Some(c) => {

@@ -293,6 +293,15 @@ struct Shared {
     /// The pad tracks ONE sequence counter for all interrupt-channel output
     /// reports, so the kernel's own numbering must not go out alongside ours.
     out_q: Mutex<VecDeque<Vec<u8>>>,
+    /// speaker_output="forward": front (music) channel pairs FL/FR waiting
+    /// for the PipeWire playback stream's process callback. Not consumed in
+    /// pad/mute mode (the capture listener doesn't push then).
+    fwd: Mutex<VecDeque<[f32; 2]>>,
+    /// Set once the pad sink's format negotiation completed (a game linked
+    /// its stream). The forward playback thread waits for this before it
+    /// connects — autoconnecting earlier races the fresh sink and the link
+    /// attempt EINVALs the forward node permanently (verified live).
+    sink_negotiated: AtomicBool,
 }
 
 /// Handle the proxy uses to hand kernel output reports to the live sink.
@@ -322,6 +331,10 @@ pub fn enqueue_output(report: &[u8]) -> bool {
 struct CbState {
     acc: Vec<f32>,
     shared: Arc<Shared>,
+    /// speaker_output="forward": also stash front-channel pairs here per
+    /// callback, then dump them into the fwd ring (one lock per callback).
+    forward: bool,
+    fwd_acc: Vec<[f32; 2]>,
 }
 
 pub struct Sink {
@@ -397,11 +410,30 @@ pub fn start(
     let shared = Arc::new(Shared {
         ring: Mutex::new(VecDeque::new()),
         out_q: Mutex::new(VecDeque::new()),
+        fwd: Mutex::new(VecDeque::new()),
+        sink_negotiated: AtomicBool::new(false),
     });
     let _ = OUT_RELAY
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .replace(shared.clone());
+
+    // speaker_output: "pad" (default) — Opus music to the pad speaker;
+    // "forward" — music plays on the normal system output (target below)
+    // while the pad speaker stays silent and haptics keep riding the link;
+    // "mute" — music dropped (haptics unaffected either way).
+    let speaker_mode = cfg.speaker_output.as_deref().unwrap_or("pad");
+    let (forward, pad_speaker) = match speaker_mode {
+        "forward" => (true, false),
+        "mute" => (false, false),
+        "pad" => (false, true),
+        other => {
+            eprintln!(
+                "sink: audio.speaker_output: unknown value {other:?} (want \"pad\", \"forward\" or \"mute\") — using \"pad\""
+            );
+            (false, true)
+        }
+    };
 
     let pw_shared = shared.clone();
     let pw_stop = stop.clone();
@@ -409,11 +441,25 @@ pub fn start(
     let node_desc = cfg
         .node_description
         .clone()
-        .unwrap_or_else(|| "DualSense Wireless Controller".into());
+        .unwrap_or_else(|| "Wireless Controller".into());
     let pw_desc = node_desc.clone();
+    let pw_forward = forward;
     handles.push(thread::spawn(move || {
-        pw_thread(pw_shared, pw_stop, pw_quit, pw_desc)
+        pw_thread(pw_shared, pw_stop, pw_quit, pw_desc, pw_forward)
     }));
+
+    // Forward playback lives in its OWN context/thread: it must only exist
+    // once the pad sink is negotiated (see Shared::sink_negotiated) and must
+    // never target the pad sink itself (that would loop captured music back
+    // into the capture — a feedback howl).
+    if forward {
+        let f_shared = shared.clone();
+        let f_stop = stop.clone();
+        let f_target = cfg.speaker_target.clone();
+        handles.push(thread::spawn(move || {
+            forward_thread(f_shared, f_stop, f_target)
+        }));
+    }
 
     let fd = unsafe { libc::dup(real.as_raw_fd()) };
     let mut file = unsafe { File::from_raw_fd(fd) };
@@ -450,6 +496,7 @@ pub fn start(
             report_id,
             interval_us,
             l2cap,
+            pad_speaker,
         )
     }));
 
@@ -467,6 +514,7 @@ fn pw_thread(
     stop: Arc<AtomicBool>,
     quit_ptr: Arc<AtomicUsize>,
     node_desc: String,
+    forward: bool,
 ) {
     let mainloop: MainLoopRc = match MainLoopRc::new(None) {
         Ok(m) => m,
@@ -484,7 +532,11 @@ fn pw_thread(
         *pw::keys::MEDIA_TYPE => "Audio",
         *pw::keys::MEDIA_CATEGORY => "Capture",
         *pw::keys::MEDIA_CLASS => "Audio/Sink",
-        *pw::keys::NODE_NAME => "mdrv-ds.dualsense-bt",
+        // Impersonate the real cabled pad's PipeWire/UCM sink name so the
+        // GE winepulse DualSense matcher (string_contains_dualsense_name +
+        // "Speaker__sink" needles) accepts this endpoint as the controller's
+        // speaker sink; PRAGMATA's audio/haptic init gates on finding it.
+        *pw::keys::NODE_NAME => "alsa_output.usb-Sony_Interactive_Entertainment_DualSense_Wireless_Controller-00.Default__Speaker__sink",
         *pw::keys::NODE_DESCRIPTION => node_desc.as_str(),
         // 10 ms quantum: haptic feedback latency = quantum + ring + opus frame;
         // the default (1024/48k ≈ 21 ms) is felt as rumble trailing the action.
@@ -502,7 +554,7 @@ fn pw_thread(
         // it the endpoint registers with a NULL container and games cannot
         // match it to the pad. The patched winepulse stub ignores the value.
         "sysfs.path" => "/devices/pci-0000:00:14.0/usb3/3-2/3-2:1.0",
-        "device.profile.description" => "DualSense Wireless Controller",
+        "device.profile.description" => "Wireless Controller",
     };
     let stream: StreamRc = match StreamRc::new(
         core.clone(),
@@ -513,21 +565,31 @@ fn pw_thread(
         Err(e) => return eprintln!("sink: stream init failed: {e}"),
     };
 
+    // speaker_output="forward": playback moved to forward_thread (own
+    // context — see start()); pw_thread only pushes front-channel pairs
+    // into shared.fwd from the capture callback (`forward` flag below).
+
     let cb_state = CbState {
         acc: Vec::with_capacity(FRAME_SAMPLES * 8),
         shared: shared.clone(),
+        forward,
+        fwd_acc: Vec::new(),
     };
     let listener = stream
         .add_local_listener_with_user_data(cb_state)
         .state_changed(|_, _, old, new| {
             eprintln!("sink: state {old:?} → {new:?}");
         })
-        .param_changed(|_stream, _d, id, param| {
+        .param_changed(|_stream, d, id, param| {
             if id != ParamType::Format.as_raw() {
                 return;
             }
             if param.is_some() {
                 eprintln!("sink: format negotiated");
+                // A game linked and drove the sink to a concrete format —
+                // the graph around us is now safe for the forward playback
+                // stream to connect (forward_thread waits on this).
+                d.shared.sink_negotiated.store(true, Ordering::Relaxed);
             }
         })
         .process(|stream, d| {
@@ -564,6 +626,7 @@ fn pw_thread(
             let mut o = start;
             let end = start + frames * stride;
             while o < end {
+                let mut quad = [0f32; 4];
                 for k in 0..4 {
                     let s = f32::from_le_bytes([
                         bytes[o + k * 4],
@@ -572,9 +635,22 @@ fn pw_thread(
                         bytes[o + k * 4 + 3],
                     ]);
                     peak_store(&PEAK_IN, s);
-                    d.acc.push(s);
+                    quad[k] = s;
+                }
+                d.acc.extend_from_slice(&quad);
+                if d.forward {
+                    d.fwd_acc.push([quad[0], quad[1]]);
                 }
                 o += stride;
+            }
+            if d.forward && !d.fwd_acc.is_empty() {
+                let mut fwd = d.shared.fwd.lock().unwrap_or_else(|e| e.into_inner());
+                for p in d.fwd_acc.drain(..) {
+                    if fwd.len() >= 4800 {
+                        fwd.pop_front(); // drop oldest under pressure (~100 ms)
+                    }
+                    fwd.push_back(p);
+                }
             }
             let whole = d.acc.len() / (FRAME_SAMPLES * 4);
             if whole > 0 {
@@ -637,6 +713,241 @@ fn pw_thread(
     eprintln!("sink: mainloop exited");
 }
 
+// ---- forward playback thread (speaker_output="forward") ---------------------
+
+/// Node name of our own pad-impersonating sink (pw_thread). The forward
+/// stream must never target it: the capture listener fills shared.fwd FROM
+/// that sink's capture, so a self-targeted playback would re-capture its
+/// own output — a feedback loop.
+const PAD_SINK_NODE: &str = "alsa_output.usb-Sony_Interactive_Entertainment_DualSense_Wireless_Controller-00.Default__Speaker__sink";
+
+/// Pick a playback target that is not our own pad sink: an explicitly
+/// configured speaker_target wins; otherwise the current default sink if it
+/// isn't ours; otherwise the first other sink present.
+fn pick_forward_target(configured: &Option<String>) -> Option<String> {
+    let pactl = |args: &[&str]| {
+        std::process::Command::new("pactl")
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    if let Some(t) = configured.as_deref().filter(|t| !t.is_empty()) {
+        if t == PAD_SINK_NODE {
+            eprintln!(
+                "sink: forward: speaker_target is the pad sink itself — ignoring (would feedback)"
+            );
+        } else {
+            return Some(t.to_string());
+        }
+    }
+    let sinks = pactl(&["list", "sinks", "short"])?;
+    let names: Vec<&str> = sinks
+        .lines()
+        .filter_map(|l| l.split_whitespace().nth(1))
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    if let Some(def) = pactl(&["get-default-sink"]).filter(|d| !d.is_empty()) {
+        if def != PAD_SINK_NODE && names.contains(&def.as_str()) {
+            return Some(def);
+        }
+    }
+    names
+        .into_iter()
+        .find(|n| *n != PAD_SINK_NODE)
+        .map(|n| n.to_string())
+}
+
+/// Playback side of speaker_output="forward": a stereo F32 48k stream fed
+/// from shared.fwd. Deliberately on its OWN PipeWire context/thread:
+///  - it only connects after the pad sink negotiated (game linked), when
+///    the graph is stable — an eager connect auto-links to the fresh pad
+///    sink and the premature link EINVALs this node permanently (seen
+///    live: stuck Connecting, no node ever registered);
+///  - it always carries an explicit non-self target.object so neither
+///    autoconnect nor WirePlumber's saved routing can loop it into the pad
+///    sink;
+///  - on stream error it tears down and retries after a backoff.
+fn forward_thread(shared: Arc<Shared>, stop: Arc<AtomicBool>, configured: Option<String>) {
+    while !stop.load(Ordering::Relaxed) {
+        if !shared.sink_negotiated.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(250));
+            continue;
+        }
+        let Some(target) = pick_forward_target(&configured) else {
+            eprintln!("sink: forward: no non-pad sink available yet");
+            thread::sleep(Duration::from_secs(2));
+            continue;
+        };
+        eprintln!("sink: forward: music → {target}");
+        match forward_run(&shared, &stop, &target) {
+            ForwardEnd::Stopped => break,
+            ForwardEnd::Failed => thread::sleep(Duration::from_secs(2)),
+        }
+    }
+    eprintln!("sink: forward thread exited");
+}
+
+enum ForwardEnd {
+    Stopped,
+    Failed,
+}
+
+fn forward_run(shared: &Arc<Shared>, stop: &Arc<AtomicBool>, target: &str) -> ForwardEnd {
+    let mainloop: MainLoopRc = match MainLoopRc::new(None) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("sink: forward mainloop init failed: {e}");
+            return ForwardEnd::Failed;
+        }
+    };
+    let context: ContextRc = match ContextRc::new(&mainloop, None) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("sink: forward context init failed: {e}");
+            return ForwardEnd::Failed;
+        }
+    };
+    let core: CoreRc = match context.connect_rc(None) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("sink: forward pipewire connect failed: {e}");
+            return ForwardEnd::Failed;
+        }
+    };
+    let mut props = properties! {
+        *pw::keys::MEDIA_TYPE => "Audio",
+        *pw::keys::MEDIA_CATEGORY => "Playback",
+        *pw::keys::MEDIA_CLASS => "Stream/Output/Audio",
+        *pw::keys::NODE_NAME => "mdrv-ds.speaker-forward",
+        *pw::keys::NODE_DESCRIPTION => "Controller music (forwarded)",
+        *pw::keys::NODE_LATENCY => "480/48000",
+    };
+    props.insert("target.object", target);
+    let stream: StreamRc = match StreamRc::new(core.clone(), "mdrv-ds-speaker-forward", props) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("sink: forward stream init failed: {e}");
+            return ForwardEnd::Failed;
+        }
+    };
+    let mut finfo = AudioInfoRaw::new();
+    finfo.set_format(AudioFormat::F32LE);
+    finfo.set_rate(48000);
+    finfo.set_channels(2);
+    let mut fposition = [0; libspa::param::audio::MAX_CHANNELS];
+    fposition[0] = libspa::sys::SPA_AUDIO_CHANNEL_FL;
+    fposition[1] = libspa::sys::SPA_AUDIO_CHANNEL_FR;
+    finfo.set_position(fposition);
+    let fobj = Object {
+        type_: SpaTypes::ObjectParamFormat.as_raw(),
+        id: ParamType::EnumFormat.as_raw(),
+        properties: finfo.into(),
+    };
+    let Ok(fser) = PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(fobj))
+    else {
+        eprintln!("sink: forward pod serialize failed");
+        return ForwardEnd::Failed;
+    };
+    let fwd_ser = fser.0.into_inner();
+    let Some(pod) = Pod::from_bytes(&fwd_ser) else {
+        eprintln!("sink: forward pod from_bytes failed");
+        return ForwardEnd::Failed;
+    };
+    let mut fparams = [pod];
+    // errored flag threaded through the listener so run() can return Failed.
+    let errored = Arc::new(AtomicBool::new(false));
+    let err_flag = errored.clone();
+    let ud = shared.clone();
+    let listener = stream
+        .add_local_listener_with_user_data(ud)
+        .state_changed(move |_, _, old, new| {
+            eprintln!("sink: forward state {old:?} → {new:?}");
+            if format!("{new:?}").contains("Error") {
+                err_flag.store(true, Ordering::Relaxed);
+            }
+        })
+        .param_changed(|_s, _d, id, param| {
+            if id == ParamType::Format.as_raw() && param.is_some() {
+                eprintln!("sink: forward format negotiated");
+            }
+        })
+        .process(|stream, d| {
+            let Some(mut buffer) = stream.dequeue_buffer() else {
+                return;
+            };
+            let datas = buffer.datas_mut();
+            if datas.is_empty() {
+                return;
+            }
+            let data = &mut datas[0];
+            let stride = 8usize; // F32 stereo interleaved
+            let Some(bytes) = data.data() else { return };
+            let frames = bytes.len() / stride;
+            let mut ring = d.fwd.lock().unwrap_or_else(|e| e.into_inner());
+            let mut o = 0usize;
+            while o < frames {
+                match ring.pop_front() {
+                    Some([l, r]) => {
+                        bytes[o * 8..o * 8 + 4].copy_from_slice(&l.to_le_bytes());
+                        bytes[o * 8 + 4..o * 8 + 8].copy_from_slice(&r.to_le_bytes());
+                    }
+                    None => {
+                        // underrun: silence the remainder — buffers
+                        // recycle, stale samples would loop the last audio
+                        for b in &mut bytes[o * 8..] {
+                            *b = 0;
+                        }
+                        break;
+                    }
+                }
+                o += 1;
+            }
+            *data.chunk_mut().size_mut() = (o * stride) as u32;
+        })
+        .register();
+    if let Err(e) = listener {
+        eprintln!("sink: forward listener register failed: {e}");
+        return ForwardEnd::Failed;
+    }
+    let fflags = StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS;
+    if let Err(e) = stream.connect(Direction::Output, None, fflags, &mut fparams) {
+        eprintln!("sink: forward connect failed: {e}");
+        return ForwardEnd::Failed;
+    }
+    eprintln!("sink: forward stream connected (music → {target})");
+    // Quit watcher: stop flag or stream error ends run().
+    let w_quit = Arc::new(AtomicUsize::new(0));
+    let quit_raw = mainloop.as_raw_ptr() as usize;
+    let w_stop = stop.clone();
+    let w_err = errored.clone();
+    // Detached by design: the watcher ends run(), not the other way round.
+    let _watcher = thread::spawn(move || {
+        while !w_stop.load(Ordering::Relaxed) && !w_err.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(250));
+        }
+        let _ = w_quit.compare_exchange(0, quit_raw, Ordering::Relaxed, Ordering::Relaxed);
+        // mainloop may not be running yet — direct quit is safe regardless.
+        unsafe { pw::sys::pw_main_loop_quit(quit_raw as *mut pw::sys::pw_main_loop) };
+    });
+    mainloop.run();
+    eprintln!("sink: forward mainloop exited");
+    if errored.load(Ordering::Relaxed) {
+        return ForwardEnd::Failed;
+    }
+    if stop.load(Ordering::Relaxed) {
+        return ForwardEnd::Stopped;
+    }
+    // run() returned without stop and without a flagged error (core
+    // disconnect etc.) — treat as retryable.
+    ForwardEnd::Failed
+}
+
 // ---- writer thread ---------------------------------------------------------
 
 /// Absorb kernel-relayed output reports (rumble/LED/trigger 0x31s). While the
@@ -689,7 +1000,9 @@ fn flush_kernel_outputs(
         // rdesc; state at [1..48]) — both decode to the same 47 B state.
         let st47: Option<[u8; 47]> = if rpt.len() == 78 && rpt[0] == 0x31 {
             Some(rpt[3..50].try_into().unwrap())
-        } else if rpt.len() == 48 && rpt[0] == 0x02 {
+        } else if rpt.len() == 48 && (rpt[0] == 0x02 || rpt[0] == 0x05) {
+            // 0x05 = game trigger-effect report: same 47 B state layout,
+            // only the trigger-FFB enable bits set.
             Some(rpt[1..48].try_into().unwrap())
         } else {
             None
@@ -806,6 +1119,7 @@ fn writer_thread(
     report_id: u8,
     interval_us: u64,
     l2cap: bool,
+    pad_speaker: bool,
 ) {
     // 0x35/0x39 mode rides a fixed 200 B Opus frame (dsneo-proven shape).
     let bitrate = if combined { bitrate } else { 160_000 };
@@ -1125,6 +1439,9 @@ fn writer_thread(
         }
         silent_windows = 0;
         // Produce 480 resampled stereo samples (speaker path, ch0/1).
+        // speaker_output=forward/mute: the pad speaker path carries silence
+        // (the Opus TLV must stay a valid frame — haptics ride the same
+        // report); music goes out via the forward playback stream instead.
         for s in 0..FRAME_SAMPLES {
             let i0 = in_pos.floor() as usize;
             let frac = (in_pos - i0 as f64) as f32;
@@ -1132,8 +1449,13 @@ fn writer_thread(
             let l1 = in_buf[i0 * 4 + 4];
             let r0 = in_buf[i0 * 4 + 1];
             let r1 = in_buf[i0 * 4 + 5];
-            pcm[s * 2] = (lerp(l0, l1, frac).clamp(-1.0, 1.0) * 32767.0) as i16;
-            pcm[s * 2 + 1] = (lerp(r0, r1, frac).clamp(-1.0, 1.0) * 32767.0) as i16;
+            if pad_speaker {
+                pcm[s * 2] = (lerp(l0, l1, frac).clamp(-1.0, 1.0) * 32767.0) as i16;
+                pcm[s * 2 + 1] = (lerp(r0, r1, frac).clamp(-1.0, 1.0) * 32767.0) as i16;
+            } else {
+                pcm[s * 2] = 0;
+                pcm[s * 2 + 1] = 0;
+            }
             in_pos += ratio;
         }
         let consumed_pairs = in_pos.floor() as usize;

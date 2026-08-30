@@ -5,6 +5,22 @@
 # report (until PS is released), so games and mdrv-gm's PS-tap never see them.
 # Apply changes with: mdrv-ds keymap reload
 
+# Top-level options (must appear BEFORE any [table]):
+# transport = 'l2cap'    # self-owned BT HID session (see README)
+# force_bus = 'usb'      # USB-chimera view: on a BT (l2cap) DualSense
+#                       # session, create the virtual pad as bus=USB with
+#                       # the USB report descriptor and translate frames
+#                       # both ways — for games that gate adaptive triggers
+#                       # on "pad is Bluetooth" (PRAGMATA). Leave unset for
+#                       # the native BT presentation (required by FF16).
+#                       # Takes effect on the next pad (re)connect.
+# swap_cross_circle = true # Swap the cross (X) and circle (O) face buttons
+#                       # on the virtual pad — JP-style confirm where O
+#                       # confirms. Applied before every consumer (game,
+#                       # kernel, chords), so games visibly respond to the
+#                       # swapped button. On-screen prompt glyphs are NOT
+#                       # redrawn. DualSense chimera sessions; default off.
+
 [chords]
 # screenshot
 share    = 'shell:grim /tmp/shot-$(date +%s).png'
@@ -35,3 +51,10 @@ touchpad = 'shell:mdrv-ds mouse toggle'
 #speaker = true          # force internal speaker; absent = auto-route by jack
 #test_tone = false       # Phase-1 440 Hz verification tone
 #volume = 0x64           # headphone volume 0x00..0x7f
+#speaker_output = 'forward' # Where the pad-stream's music (front) channels
+#                       # go: 'pad' (default — pad speaker), 'forward' (play
+#                       # on the normal system output; pad speaker silent,
+#                       # haptics unaffected — rerouting in pavucontrol
+#                       # breaks rumble, this doesn't), or 'mute' (drop).
+#speaker_target = 'alsa_output.pci-xxxx.analog-stereo' # node.name to play
+#                       # on when speaker_output='forward'; absent = default.

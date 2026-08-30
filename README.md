@@ -44,6 +44,23 @@ Wine/games ◀── kernel evdev/hidraw ◀── PipeWire capture ◀── si
   Sony's libScePad; see `DS5_HID_REPORT_DESCRIPTOR_MERGED` in l2cap.rs.)
   Feature GETs are served from the live cache (MAC rewritten to the virtual
   address, kernel-convention CRCs).
+- **USB-chimera view** (`force_bus = "usb"` in config.toml): on a BT L2CAP
+  DualSense session, create the virtual pad as bus=USB with the real USB
+  descriptor instead, translate BT 0x31 input frames to USB 0x01 reports,
+  and translate game USB outputs (48 B 0x02/0x05) and feature reports back
+  to BT shapes. For games that gate adaptive triggers/haptics on "pad is
+  Bluetooth" (RE Engine: PRAGMATA) while keeping FF16's native-BT path
+  (default) untouched. Takes effect on the next pad (re)connect.
+- **Cross/circle swap** (`swap_cross_circle = true`): swaps X/O on the
+  virtual pad (JP-style confirm). Applied in the relay before every
+  consumer — game, kernel, chords — so games visibly respond to the
+  swapped button; prompt glyphs are not redrawn. Chimera sessions,
+  default off.
+- **Music forwarding** (`audio.speaker_output = "forward"`, optional
+  `audio.speaker_target = "<node.name>"`): plays the pad-stream's music
+  channels on the normal system output while haptics keep riding the pad
+  link (rerouting the game's stream in pavucontrol breaks rumble).
+  `"pad"` (default) keeps the pad speaker; `"mute"` drops the music.
 - **Sink** (`src/sink.rs`): captures the PipeWire stream on our impersonated
   endpoint (F32 48k quad), gates silence, encodes speaker audio as Opus CBR,
   packs RL/RR as s8 haptics into 398 B 0x36 reports, and overlays kernel
