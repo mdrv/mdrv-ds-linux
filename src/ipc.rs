@@ -24,6 +24,10 @@ pub const TAG_INPUT: u8 = b'I';
 pub const TAG_NEUTRAL: u8 = b'N';
 pub const TAG_GET_REPLY: u8 = b'G';
 pub const TAG_SET_ACK: u8 = b'A';
+/// proxy → holder: destroy the virtual pad (XInput instance teardown on
+/// live disable; the default DS holder never receives this today) — the
+/// holder answers nothing and resets its create key/neutral state.
+pub const TAG_DESTROY: u8 = b'D';
 pub const TAG_CREATE_ACK: u8 = b'c';
 pub const TAG_OUTPUT: u8 = b'O';
 pub const TAG_GET_REQ: u8 = b'Q';
@@ -31,11 +35,20 @@ pub const TAG_SET_REQ: u8 = b'T';
 pub const TAG_NOTICE: u8 = b'X';
 const MAX_FRAME: usize = 16384;
 
-pub fn sock_path() -> PathBuf {
+
+/// Instance-aware socket path: "" is the default DualSense holder,
+/// "xi" is the second (XInput) holder — separate socket, separate pad,
+/// zero interaction with the default instance.
+pub fn sock_path_for(instance: &str) -> PathBuf {
+    let name = if instance.is_empty() {
+        "mdrv-ds.sock"
+    } else {
+        "mdrv-ds-xi.sock"
+    };
     std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("mdrv-ds.sock")
+        .join(name)
 }
 
 pub fn send<W: Write>(w: &mut W, tag: u8, payload: &[u8]) -> io::Result<()> {
@@ -61,26 +74,35 @@ pub fn recv<R: Read>(r: &mut R) -> io::Result<(u8, Vec<u8>)> {
     Ok((buf[0], buf[1..].to_vec()))
 }
 
-pub fn connect() -> io::Result<UnixStream> {
-    UnixStream::connect(sock_path())
+
+pub fn connect_for(instance: &str) -> io::Result<UnixStream> {
+    UnixStream::connect(sock_path_for(instance))
 }
 
 /// Connect to the holder, spawning one (detached) if the socket is down.
 /// The systemd `mdrv-ds-holder.service` unit is the canonical holder; the
 /// spawn fallback covers CLI/dev runs of the proxy.
 pub fn ensure_holder() -> io::Result<UnixStream> {
-    if let Ok(s) = connect() {
+    ensure_holder_for("")
+}
+
+/// Same as `ensure_holder` for an instance: spawns `mdrv-ds holder <instance>`
+/// (detached) when the instance socket is down. Used by the XInput relay; the
+/// default instance keeps its systemd unit + spawn fallback unchanged.
+pub fn ensure_holder_for(instance: &str) -> io::Result<UnixStream> {
+    if let Ok(s) = connect_for(instance) {
         return Ok(s);
     }
     let exe = std::env::current_exe()?;
-    let _ = Command::new(exe)
-        .arg("holder")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .spawn();
+    let mut cmd = Command::new(exe);
+    cmd.arg("holder");
+    if !instance.is_empty() {
+        cmd.arg(instance);
+    }
+    let _ = cmd.stdin(Stdio::null()).stdout(Stdio::null()).spawn();
     for _ in 0..40 {
         std::thread::sleep(Duration::from_millis(100));
-        if let Ok(s) = connect() {
+        if let Ok(s) = connect_for(instance) {
             return Ok(s);
         }
     }

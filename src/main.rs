@@ -1,5 +1,5 @@
-mod audiobridge;
 mod audio;
+mod audiobridge;
 mod config;
 mod hid;
 mod holder;
@@ -9,6 +9,7 @@ mod mouse;
 mod proxy;
 mod sink;
 mod uhid;
+mod xinput;
 
 use std::path::PathBuf;
 
@@ -19,8 +20,10 @@ fn main() {
         "status" => hid::info(),
         "feature" => feature_cmd(&args[1..]),
         "mouse" => mouse::cmd(&args[1..]),
-        "holder" => std::process::exit(holder::run()),
+        "holder" => std::process::exit(holder::run(args.get(1).map(String::as_str))),
         "keymap" => keymap_cmd(&args[1..]),
+        "speaker" => speaker_cmd(&args[1..]),
+        "xinput" => xinput_cmd(&args[1..]),
         "proxy" => {
             let mut opts = proxy::ProxyOpts {
                 pad: None,
@@ -64,22 +67,9 @@ fn keymap_cmd(rest: &[String]) {
             proxy::fire_test(name);
         }
         Some("reload") => {
-            let base = std::env::var_os("XDG_RUNTIME_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/tmp"));
-            let pidfile = base.join("mdrv-ds.pid");
-            let pid: i32 = match std::fs::read_to_string(&pidfile)
-                .ok()
-                .and_then(|s| s.trim().parse().ok())
-            {
-                Some(p) => p,
-                None => {
-                    eprintln!("no running proxy (pidfile {:?} missing)", pidfile);
-                    std::process::exit(1);
-                }
-            };
-            unsafe { libc::kill(pid, libc::SIGHUP) };
-            println!("SIGHUP → proxy (pid {pid}): reloading keymap");
+            if let Some(pid) = hup_proxy() {
+                println!("SIGHUP → proxy (pid {pid}): reloading keymap");
+            }
         }
         None | Some("list") | Some("status") => {
             let cfg = config::load();
@@ -102,6 +92,128 @@ fn keymap_cmd(rest: &[String]) {
     }
 }
 
+/// SIGHUP the running proxy (pidfile in $XDG_RUNTIME_DIR). Exits 1 with a
+/// message when no proxy is running. Returns the pid signalled.
+fn hup_proxy() -> Option<i32> {
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let pidfile = base.join("mdrv-ds.pid");
+    let pid: i32 = match std::fs::read_to_string(&pidfile)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+    {
+        Some(p) => p,
+        None => {
+            eprintln!("no running proxy (pidfile {:?} missing)", pidfile);
+            std::process::exit(1);
+        }
+    };
+    unsafe { libc::kill(pid, libc::SIGHUP) };
+    Some(pid)
+}
+
+/// Runtime speaker_output override: writes a volatile marker file in
+/// $XDG_RUNTIME_DIR and SIGHUPs the proxy, which recomputes the live mode
+/// (`sink::current_mode`: override file first, config value as fallback).
+/// `reset` clears the override back to the config value.
+fn speaker_cmd(rest: &[String]) {
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let file = base.join("mdrv-ds-speaker");
+    match rest.first().map(String::as_str) {
+        Some(mode @ ("pad" | "forward" | "mute")) => {
+            std::fs::write(&file, mode).expect("write override file");
+            if let Some(pid) = hup_proxy() {
+                println!("speaker_output = {mode} (override) → proxy pid {pid}");
+            }
+        }
+        Some("reset") => {
+            let _ = std::fs::remove_file(&file);
+            if let Some(pid) = hup_proxy() {
+                println!("speaker_output override cleared → config value (proxy pid {pid})");
+            }
+        }
+        None | Some("status") => {
+            let override_ = std::fs::read_to_string(&file)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let cfg = config::load();
+            let cfg_val = cfg.audio.speaker_output.as_deref().unwrap_or("pad");
+            let pid = std::fs::read_to_string(base.join("mdrv-ds.pid"))
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok());
+            match override_ {
+                Some(o) => println!(
+                    "speaker_output = {o} (override; config says {cfg_val}) proxy pid {:?}",
+                    pid
+                ),
+                None => println!(
+                    "speaker_output = {cfg_val} (config; no override) proxy pid {:?}",
+                    pid
+                ),
+            }
+        }
+        Some(other) => {
+            eprintln!("unknown speaker arg: {other} (pad|forward|mute|reset|status)");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Runtime XInput-emulation override (speaker pattern): writes a volatile
+/// marker file in $XDG_RUNTIME_DIR and SIGHUPs the proxy, which raises or
+/// tears down the second virtual pad live (see xinput::effective). `reset`
+/// clears the override back to the config value.
+fn xinput_cmd(rest: &[String]) {
+    let file = xinput::override_path();
+    match rest.first().map(String::as_str) {
+        Some(on @ ("on" | "off")) => {
+            std::fs::write(&file, on).expect("write override file");
+            if let Some(pid) = hup_proxy() {
+                println!("xinput = {on} (override) → proxy pid {pid}");
+            }
+        }
+        Some("reset") => {
+            let _ = std::fs::remove_file(&file);
+            if let Some(pid) = hup_proxy() {
+                println!("xinput override cleared → config value (proxy pid {pid})");
+            }
+        }
+        None | Some("status") => {
+            let override_ = std::fs::read_to_string(&file)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let cfg = config::load();
+            let cfg_val = cfg.xinput();
+            let pid = std::fs::read_to_string(
+                std::env::var_os("XDG_RUNTIME_DIR")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("/tmp"))
+                    .join("mdrv-ds.pid"),
+            )
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok());
+            match override_ {
+                Some(o) => println!(
+                    "xinput = {o} (override; config says {cfg_val}) proxy pid {:?}",
+                    pid
+                ),
+                None => println!(
+                    "xinput = {cfg_val} (config; no override) proxy pid {:?}",
+                    pid
+                ),
+            }
+        }
+        Some(other) => {
+            eprintln!("unknown xinput arg: {other} (on|off|reset|status)");
+            std::process::exit(2);
+        }
+    }
+}
 fn usage() {
     println!(
         "mdrv-ds — DualSense hidraw proxy (transport-matching, verbatim relay)\n\
@@ -114,6 +226,8 @@ fn usage() {
          \x20 mdrv-ds holder                     virtual-pad holder daemon (systemd unit)\n\
          \x20 mdrv-ds mouse [on|off|toggle|status] touchpad-as-mouse (standalone)\n\
          \x20 mdrv-ds keymap [list|reload|test <name>]   PS-chords: show / reload / fire one\n\
+         \x20 mdrv-ds speaker [pad|forward|mute|reset]  live speaker_output switch (status default)\n\
+         \x20 mdrv-ds xinput [on|off|reset]      live XInput pad emulation switch (status default)\n\
          \n\
          PROXY FLAGS:\n\
          \x20 --pad <path>       explicit hidraw (default: first DualSense, USB preferred)\n\

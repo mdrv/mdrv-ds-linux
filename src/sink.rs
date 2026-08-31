@@ -20,8 +20,8 @@
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::Write;
-use std::os::unix::io::{AsRawFd, FromRawFd};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -302,11 +302,165 @@ struct Shared {
     /// connects — autoconnecting earlier races the fresh sink and the link
     /// attempt EINVALs the forward node permanently (verified live).
     sink_negotiated: AtomicBool,
+    /// Live pad link (L2CAP interrupt-channel fd), swapped across pad
+    /// sessions by `attach_pad`/`detach_pad`. `None` = no pad: the writer
+    /// pauses (no writes, no keepalive) while the sink node stays alive so
+    /// games never see the audio endpoint die mid-run.
+    pub intr: Mutex<Option<Arc<OwnedFd>>>,
+    /// Bumped on every `attach_pad`; the writer drops buffered audio and
+    /// re-runs its per-link init (handshake) when it changes.
+    pub gen: AtomicU64,
+    /// Live speaker_output mode (MODE_* below). Written by the proxy on
+    /// RELOAD/SIGHUP and by `mdrv-ds speaker <mode>`; read per audio window
+    /// by the capture callback (fwd push gate) and the writer (pad-speaker
+    /// Opus gate) and polled by forward_thread.
+    mode: AtomicU8,
+    /// True when the live pad link is L2CAP (BT interrupt channel). Chooses
+    /// the wire shape `rumble()` emits: 48B 0x02 USB-style report via the
+    /// out_q (L2CAP writer restamps), vs a full 78B 0x31 BT frame built with
+    /// audio::state_report for hidraw-BT pads.
+    l2cap: AtomicBool,
 }
 
 /// Handle the proxy uses to hand kernel output reports to the live sink.
 static OUT_RELAY: Mutex<Option<Arc<Shared>>> = Mutex::new(None);
 const OUT_Q_CAP: usize = 16;
+
+// ---- speaker_output mode switching (live) -----------------------------------
+
+pub const MODE_PAD: u8 = 0;
+pub const MODE_FORWARD: u8 = 1;
+pub const MODE_MUTE: u8 = 2;
+
+/// Relay for live speaker-mode updates from the proxy process side (the
+/// Sink handle never leaves run(), so the CLI/RELOAD paths reach the shared
+/// mode cell through this static, mirroring OUT_RELAY).
+static MODE_RELAY: Mutex<Option<Arc<Shared>>> = Mutex::new(None);
+
+/// Where `mdrv-ds speaker <mode>` drops the runtime override (volatile by
+/// design: `speaker reset` or a service restart returns to config.toml).
+fn speaker_override_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("XDG_RUNTIME_DIR").map(|d| {
+        let mut p = std::path::PathBuf::from(d);
+        p.push("mdrv-ds-speaker");
+        p
+    })
+}
+
+/// Config-string → mode code ("pad" default, unknown warns).
+pub fn speaker_mode_code(value: Option<&str>) -> u8 {
+    match value.unwrap_or("pad") {
+        "forward" => MODE_FORWARD,
+        "mute" => MODE_MUTE,
+        "pad" => MODE_PAD,
+        other => {
+            eprintln!(
+                "sink: audio.speaker_output: unknown value {other:?} (want \"pad\", \"forward\" or \"mute\") — using \"pad\""
+            );
+            MODE_PAD
+        }
+    }
+}
+
+/// Effective mode: runtime override file (if present) else the config value.
+/// Only read at sink start / reload — the hot path uses Shared.mode.
+pub fn current_mode(cfg_value: Option<&str>) -> u8 {
+    if let Some(p) = speaker_override_path() {
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            let t = s.trim();
+            if !t.is_empty() {
+                let code = match t {
+                    "forward" => MODE_FORWARD,
+                    "mute" => MODE_MUTE,
+                    "pad" => MODE_PAD,
+                    _ => {
+                        eprintln!(
+                            "sink: speaker override file holds unknown mode {t:?} — ignoring"
+                        );
+                        return speaker_mode_code(cfg_value);
+                    }
+                };
+                return code;
+            }
+        }
+    }
+    speaker_mode_code(cfg_value)
+}
+
+pub fn mode_name(mode: u8) -> &'static str {
+    match mode {
+        MODE_FORWARD => "forward",
+        MODE_MUTE => "mute",
+        _ => "pad",
+    }
+}
+
+/// Flip the live mode (no-op when no sink session is running).
+pub fn set_speaker_mode(mode: u8) -> bool {
+    let guard = MODE_RELAY.lock().unwrap_or_else(|e| e.into_inner());
+    match guard.as_ref() {
+        Some(shared) => {
+            shared.mode.store(mode, Ordering::Relaxed);
+            true
+        }
+        None => false,
+    }
+}
+
+// ---- persistent pad-link management (sink survives pad sessions) ------------
+//
+// The sink node is a process-lifetime resource on L2CAP: pad sessions come
+// and go, but tearing the sink down mid-run kills the game's 4ch haptics
+// stream, and RE Engine never re-commits AudioClient_Initialize (verified:
+// 2026-08-30 PRAGMATA reconnect loss). The proxy attaches the session's
+// interrupt-channel fd here and detaches it on teardown; the writer thread
+// polls the generation counter and re-inits per link.
+
+/// Stop flag for the persistent sink (proxy exit path mirrors Sink::stop).
+static SINK_STOP: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
+
+/// Install a fresh pad link (dups `fd`; caller keeps ownership). Bumps the
+/// generation so the writer re-runs its per-link init. Returns false when no
+/// persistent sink is live.
+pub fn attach_pad(fd: std::os::unix::io::RawFd) -> bool {
+    let guard = MODE_RELAY.lock().unwrap_or_else(|e| e.into_inner());
+    match guard.as_ref() {
+        Some(shared) => {
+            let dup = unsafe { libc::dup(fd) };
+            if dup < 0 {
+                return false;
+            }
+            *shared.intr.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(Arc::new(unsafe { OwnedFd::from_raw_fd(dup) }));
+            shared.gen.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Mark the pad gone: the writer pauses (no writes, no keepalive) while the
+/// sink node stays alive for games.
+pub fn detach_pad() -> bool {
+    let guard = MODE_RELAY.lock().unwrap_or_else(|e| e.into_inner());
+    match guard.as_ref() {
+        Some(shared) => {
+            *shared.intr.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Stop the persistent sink (proxy exit path; a stub Sink handle can't).
+pub fn stop_all() {
+    let flag = SINK_STOP.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(flag) = flag {
+        flag.store(true, Ordering::Relaxed);
+    }
+    let _ = OUT_RELAY.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let _ = MODE_RELAY.lock().unwrap_or_else(|e| e.into_inner()).take();
+}
 
 /// Try to route a kernel BT output report through the sink writer (unified
 /// sequence numbering). Returns false when no sink is running — caller should
@@ -326,30 +480,79 @@ pub fn enqueue_output(report: &[u8]) -> bool {
     }
 }
 
+/// XInput rumble injection: enqueue a minimal DS output state carrying
+/// ONLY the rumble motors (flag0 0x03, motor bytes; every other section's
+/// enable bits zero → LEDs/audio untouched), shaped for the live sink
+/// flavor — 48 B USB 0x02 on L2CAP (kernel-output shape), 78 B BT 0x31 on
+/// hidraw so idle relays stay well-formed. Returns false when no sink is
+/// running (USB sessions — caller writes the pad's hidraw directly).
+pub fn rumble(strong: u8, weak: u8) -> bool {
+    let guard = OUT_RELAY.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(shared) = guard.as_ref() else {
+        return false;
+    };
+    let mut st = [0u8; 47];
+    st[0] = 0x03; // valid_flag0: compatible-vibration motors
+    st[2] = weak; // motor_right (weak)
+    st[3] = strong; // motor_left (strong)
+    let rpt = if shared.l2cap.load(Ordering::Relaxed) {
+        let mut v = Vec::with_capacity(48);
+        v.push(0x02);
+        v.extend_from_slice(&st);
+        v
+    } else {
+        crate::audio::state_report(0, &st)
+    };
+    let mut q = shared.out_q.lock().unwrap_or_else(|e| e.into_inner());
+    if q.len() >= OUT_Q_CAP {
+        q.pop_front(); // keep the newest rumble state
+    }
+    q.push_back(rpt);
+    true
+}
+
 /// User-data for the PipeWire process callback: a partial-frame accumulator
 /// plus the shared ring.
 struct CbState {
     acc: Vec<f32>,
     shared: Arc<Shared>,
-    /// speaker_output="forward": also stash front-channel pairs here per
-    /// callback, then dump them into the fwd ring (one lock per callback).
-    forward: bool,
+    /// Front-channel pairs stashed per callback while the live mode is
+    /// "forward", then dumped into the fwd ring (one lock per callback).
     fwd_acc: Vec<[f32; 2]>,
 }
 
 pub struct Sink {
-    stop: Arc<AtomicBool>,
+    /// `None` on stub handles handed out by `ensure_started` after the first
+    /// spawn — the original handle (or `stop_all`) owns the threads.
+    stop: Option<Arc<AtomicBool>>,
     /// Raw pw_main_loop pointer for cross-thread quit (0 until connected).
-    quit_ptr: Arc<AtomicUsize>,
+    quit_ptr: Option<Arc<AtomicUsize>>,
     handles: Vec<JoinHandle<()>>,
 }
 
 impl Sink {
+    fn stub() -> Sink {
+        Sink {
+            stop: None,
+            quit_ptr: None,
+            handles: Vec::new(),
+        }
+    }
+
     pub fn stop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        let Some(stop) = self.stop.as_ref() else {
+            return; // stub: the persistent sink keeps running by design
+        };
+        stop.store(true, Ordering::Relaxed);
         // detach the output relay first so no report gets queued for a dying writer
         let _ = OUT_RELAY.lock().unwrap_or_else(|e| e.into_inner()).take();
-        let p = self.quit_ptr.load(Ordering::Relaxed);
+        let _ = MODE_RELAY.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let _ = SINK_STOP.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let p = self
+            .quit_ptr
+            .as_ref()
+            .map(|q| q.load(Ordering::Relaxed))
+            .unwrap_or(0);
         if p != 0 {
             unsafe { pw::sys::pw_main_loop_quit(p as *mut pw::sys::pw_main_loop) };
         }
@@ -371,12 +574,47 @@ fn restamp_kernel_output(report: &mut [u8], seq: u8) {
     }
 }
 
-/// Entry point called from the proxy when transport == Bluetooth.
+/// Persistent entry (L2CAP): the sink node lives for the whole proxy run so
+/// pad sessions can come and go without games losing the 4ch endpoint. The
+/// pad link itself attaches/detaches per session via
+/// `attach_pad`/`detach_pad`. Later calls return an inert stub — the first
+/// handle (or `stop_all` at exit) owns the threads.
+pub fn ensure_started(cfg: &AudioConfig) -> Sink {
+    if MODE_RELAY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some()
+    {
+        eprintln!("sink: persistent sink already up — reusing node");
+        return Sink::stub();
+    }
+    spawn_sink(cfg, None, None, Vec::new())
+}
+
+/// Legacy session-scoped entry (hidraw transports).
 pub fn start(
     real: &File,
     cfg: &AudioConfig,
     flens: &std::collections::HashMap<u8, usize>,
     l2cap: bool,
+) -> Sink {
+    let sizes: Vec<(u8, usize)> = [0x09u8, 0x20, 0x05]
+        .iter()
+        .filter_map(|id| flens.get(id).map(|&s| (*id, s + 1)))
+        .collect();
+    let vds_real = if !l2cap && !sizes.is_empty() {
+        Some(real)
+    } else {
+        None
+    };
+    spawn_sink(cfg, Some(real), vds_real, sizes)
+}
+
+fn spawn_sink(
+    cfg: &AudioConfig,
+    pad_fd: Option<&File>,
+    vds_real: Option<&File>,
+    vds_sizes: Vec<(u8, usize)>,
 ) -> Sink {
     let stop = Arc::new(AtomicBool::new(false));
     let quit_ptr = Arc::new(AtomicUsize::new(0));
@@ -386,54 +624,52 @@ pub fn start(
     // 0x05} every 5 s; a link that naps mid-stream is a stutter source.
     // (hidraw mode only: on L2CAP the pad naps nothing — v29 streamed 30 s
     // with no polls and the socket is not an hidraw anyway.)
-    if !l2cap {
+    if let Some(real) = vds_real {
         let fd = unsafe { libc::dup(real.as_raw_fd()) };
         let mut file = unsafe { File::from_raw_fd(fd) };
         let p_stop = stop.clone();
-        let sizes: Vec<(u8, usize)> = [0x09u8, 0x20, 0x05]
-            .iter()
-            .filter_map(|id| flens.get(id).map(|&s| (*id, s + 1)))
-            .collect();
-        if !sizes.is_empty() {
-            handles.push(thread::spawn(move || {
-                while !p_stop.load(Ordering::Relaxed) {
-                    for (id, size) in &sizes {
-                        let mut buf = vec![0u8; *size];
-                        let _ = crate::hid::get_feature(&mut file, *id, &mut buf);
-                    }
-                    thread::sleep(Duration::from_millis(5000));
+        let sizes = vds_sizes;
+        handles.push(thread::spawn(move || {
+            while !p_stop.load(Ordering::Relaxed) {
+                for (id, size) in &sizes {
+                    let mut buf = vec![0u8; *size];
+                    let _ = crate::hid::get_feature(&mut file, *id, &mut buf);
                 }
-            }));
-        }
+                thread::sleep(Duration::from_millis(5000));
+            }
+        }));
     }
 
+    let intr_fd = pad_fd.map(|f| {
+        let fd = unsafe { libc::dup(f.as_raw_fd()) };
+        Arc::new(unsafe { OwnedFd::from_raw_fd(fd) })
+    });
     let shared = Arc::new(Shared {
         ring: Mutex::new(VecDeque::new()),
         out_q: Mutex::new(VecDeque::new()),
         fwd: Mutex::new(VecDeque::new()),
         sink_negotiated: AtomicBool::new(false),
+        intr: Mutex::new(intr_fd),
+        gen: AtomicU64::new(u64::from(pad_fd.is_some())),
+        mode: AtomicU8::new(current_mode(cfg.speaker_output.as_deref())),
+        l2cap: AtomicBool::new(pad_fd.is_none()),
     });
     let _ = OUT_RELAY
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .replace(shared.clone());
-
-    // speaker_output: "pad" (default) — Opus music to the pad speaker;
-    // "forward" — music plays on the normal system output (target below)
-    // while the pad speaker stays silent and haptics keep riding the link;
-    // "mute" — music dropped (haptics unaffected either way).
-    let speaker_mode = cfg.speaker_output.as_deref().unwrap_or("pad");
-    let (forward, pad_speaker) = match speaker_mode {
-        "forward" => (true, false),
-        "mute" => (false, false),
-        "pad" => (false, true),
-        other => {
-            eprintln!(
-                "sink: audio.speaker_output: unknown value {other:?} (want \"pad\", \"forward\" or \"mute\") — using \"pad\""
-            );
-            (false, true)
-        }
-    };
+    let _ = MODE_RELAY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .replace(shared.clone());
+    let _ = SINK_STOP
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .replace(stop.clone());
+    eprintln!(
+        "sink: speaker_output = {} (live-switchable: mdrv-ds speaker pad|forward|mute|reset)",
+        mode_name(shared.mode.load(Ordering::Relaxed))
+    );
 
     let pw_shared = shared.clone();
     let pw_stop = stop.clone();
@@ -443,16 +679,17 @@ pub fn start(
         .clone()
         .unwrap_or_else(|| "Wireless Controller".into());
     let pw_desc = node_desc.clone();
-    let pw_forward = forward;
     handles.push(thread::spawn(move || {
-        pw_thread(pw_shared, pw_stop, pw_quit, pw_desc, pw_forward)
+        pw_thread(pw_shared, pw_stop, pw_quit, pw_desc)
     }));
 
-    // Forward playback lives in its OWN context/thread: it must only exist
-    // once the pad sink is negotiated (see Shared::sink_negotiated) and must
-    // never target the pad sink itself (that would loop captured music back
-    // into the capture — a feedback howl).
-    if forward {
+    // Forward playback lives in its OWN context/thread and is spawned in
+    // EVERY mode: it self-gates on Shared.mode (polls 250 ms), so a live
+    // switch pad→forward comes up without restarting the session. It must
+    // only connect once the pad sink negotiated (Shared::sink_negotiated)
+    // and must never target the pad sink itself (that would loop captured
+    // music back into the capture — a feedback howl).
+    {
         let f_shared = shared.clone();
         let f_stop = stop.clone();
         let f_target = cfg.speaker_target.clone();
@@ -461,10 +698,9 @@ pub fn start(
         }));
     }
 
-    let fd = unsafe { libc::dup(real.as_raw_fd()) };
-    let mut file = unsafe { File::from_raw_fd(fd) };
     let w_shared = shared.clone();
     let w_stop = stop.clone();
+    let l2cap = pad_fd.is_none(); // persistent path is L2CAP-only by design
     let bitrate = cfg.bitrate.unwrap_or(160_000).clamp(6_000, 510_000);
     let combined = l2cap || cfg.report.as_deref() == Some("0x36");
     let report_id: u8 = match cfg.report.as_deref() {
@@ -485,7 +721,6 @@ pub fn start(
     let output = cfg.output;
     handles.push(thread::spawn(move || {
         writer_thread(
-            &mut file,
             &w_shared,
             &w_stop,
             bitrate,
@@ -496,13 +731,12 @@ pub fn start(
             report_id,
             interval_us,
             l2cap,
-            pad_speaker,
         )
     }));
 
     Sink {
-        stop,
-        quit_ptr,
+        stop: Some(stop),
+        quit_ptr: Some(quit_ptr),
         handles,
     }
 }
@@ -514,7 +748,6 @@ fn pw_thread(
     stop: Arc<AtomicBool>,
     quit_ptr: Arc<AtomicUsize>,
     node_desc: String,
-    forward: bool,
 ) {
     let mainloop: MainLoopRc = match MainLoopRc::new(None) {
         Ok(m) => m,
@@ -566,13 +799,13 @@ fn pw_thread(
     };
 
     // speaker_output="forward": playback moved to forward_thread (own
-    // context — see start()); pw_thread only pushes front-channel pairs
-    // into shared.fwd from the capture callback (`forward` flag below).
+    // context — see start()); the capture callback pushes front-channel
+    // pairs into shared.fwd only while the live mode is MODE_FORWARD
+    // (checked per callback — mode can flip at runtime).
 
     let cb_state = CbState {
         acc: Vec::with_capacity(FRAME_SAMPLES * 8),
         shared: shared.clone(),
-        forward,
         fwd_acc: Vec::new(),
     };
     let listener = stream
@@ -623,6 +856,7 @@ fn pw_thread(
             // Accumulate raw F32 quads; push whole 480-sample frames to the
             // ring (RT-safe: one lock per callback, no allocation beyond the
             // accumulator's spare capacity).
+            let fwd_live = d.shared.mode.load(Ordering::Relaxed) == MODE_FORWARD;
             let mut o = start;
             let end = start + frames * stride;
             while o < end {
@@ -638,12 +872,12 @@ fn pw_thread(
                     quad[k] = s;
                 }
                 d.acc.extend_from_slice(&quad);
-                if d.forward {
+                if fwd_live {
                     d.fwd_acc.push([quad[0], quad[1]]);
                 }
                 o += stride;
             }
-            if d.forward && !d.fwd_acc.is_empty() {
+            if fwd_live && !d.fwd_acc.is_empty() {
                 let mut fwd = d.shared.fwd.lock().unwrap_or_else(|e| e.into_inner());
                 for p in d.fwd_acc.drain(..) {
                     if fwd.len() >= 4800 {
@@ -765,6 +999,9 @@ fn pick_forward_target(configured: &Option<String>) -> Option<String> {
 
 /// Playback side of speaker_output="forward": a stereo F32 48k stream fed
 /// from shared.fwd. Deliberately on its OWN PipeWire context/thread:
+///  - spawned in every mode, self-gated on Shared.mode (250 ms poll): a
+///    live `mdrv-ds speaker forward` brings it up without a session
+///    restart, and any other mode parks it (stream torn down);
 ///  - it only connects after the pad sink negotiated (game linked), when
 ///    the graph is stable — an eager connect auto-links to the fresh pad
 ///    sink and the premature link EINVALs this node permanently (seen
@@ -772,9 +1009,14 @@ fn pick_forward_target(configured: &Option<String>) -> Option<String> {
 ///  - it always carries an explicit non-self target.object so neither
 ///    autoconnect nor WirePlumber's saved routing can loop it into the pad
 ///    sink;
-///  - on stream error it tears down and retries after a backoff.
+///  - on stream error (or a mode flip away from forward) it tears down and
+///    retries after a backoff.
 fn forward_thread(shared: Arc<Shared>, stop: Arc<AtomicBool>, configured: Option<String>) {
     while !stop.load(Ordering::Relaxed) {
+        if shared.mode.load(Ordering::Relaxed) != MODE_FORWARD {
+            thread::sleep(Duration::from_millis(250));
+            continue;
+        }
         if !shared.sink_negotiated.load(Ordering::Relaxed) {
             thread::sleep(Duration::from_millis(250));
             continue;
@@ -926,9 +1168,13 @@ fn forward_run(shared: &Arc<Shared>, stop: &Arc<AtomicBool>, target: &str) -> Fo
     let quit_raw = mainloop.as_raw_ptr() as usize;
     let w_stop = stop.clone();
     let w_err = errored.clone();
+    let w_shared = shared.clone();
     // Detached by design: the watcher ends run(), not the other way round.
     let _watcher = thread::spawn(move || {
-        while !w_stop.load(Ordering::Relaxed) && !w_err.load(Ordering::Relaxed) {
+        while !w_stop.load(Ordering::Relaxed)
+            && !w_err.load(Ordering::Relaxed)
+            && w_shared.mode.load(Ordering::Relaxed) == MODE_FORWARD
+        {
             thread::sleep(Duration::from_millis(250));
         }
         let _ = w_quit.compare_exchange(0, quit_raw, Ordering::Relaxed, Ordering::Relaxed);
@@ -937,6 +1183,10 @@ fn forward_run(shared: &Arc<Shared>, stop: &Arc<AtomicBool>, target: &str) -> Fo
     });
     mainloop.run();
     eprintln!("sink: forward mainloop exited");
+    if shared.mode.load(Ordering::Relaxed) != MODE_FORWARD {
+        eprintln!("sink: forward: speaker mode changed — tearing down");
+        return ForwardEnd::Failed;
+    }
     if errored.load(Ordering::Relaxed) {
         return ForwardEnd::Failed;
     }
@@ -1108,7 +1358,6 @@ pub fn sink_merge63(state: &mut [u8; 63], hp_volume: u8, output: bool, jack: boo
 }
 
 fn writer_thread(
-    file: &mut File,
     shared: &Shared,
     stop: &AtomicBool,
     bitrate: i32,
@@ -1119,7 +1368,6 @@ fn writer_thread(
     report_id: u8,
     interval_us: u64,
     l2cap: bool,
-    pad_speaker: bool,
 ) {
     // 0x35/0x39 mode rides a fixed 200 B Opus frame (dsneo-proven shape).
     let bitrate = if combined { bitrate } else { 160_000 };
@@ -1259,351 +1507,419 @@ fn writer_thread(
         ok
     };
 
-    // Unlock audio immediately (before the first combined report).
-    if l2cap {
-        if !send_l2cap_handshake(file, &mut seq, &mut mic_seq) {
-            return;
-        }
-    } else if !send_volume_unlock(file, &mut seq, &state) {
-        return;
-    }
-    loop {
-        if stop.load(Ordering::Relaxed) {
-            break;
-        }
-        // Periodic volume unlock (~2.7 s) is 0x35-hidraw-path only; vds sends
-        // the L2CAP mic handshake solely at stream start / re-prime, so the
-        // L2CAP path sends nothing extra here.
-        if !l2cap && frames_sent > 0 && frames_sent % 256 == 0 {
-            if !send_volume_unlock(file, &mut seq, &state) {
-                break;
+    // ---- persistent pad-link loop ------------------------------------------
+    // The sink outlives pad sessions: `attach_pad` installs a fresh link fd
+    // (bumping Shared.gen), `detach_pad` clears it. Each outer iteration
+    // runs one full link (state reset → handshake → streaming). When the
+    // inner loop breaks (write failure = pad gone) we release the fd and
+    // wait for the NEXT generation instead of exiting, so the game's 4ch
+    // stream on the sink node survives and haptics resume on the new link.
+    let mut cur_gen = 0u64;
+    'pads: loop {
+        // Wait for a fresh pad link (fd present AND generation moved).
+        let (fd, gen) = loop {
+            if stop.load(Ordering::Relaxed) {
+                break 'pads;
             }
-        }
-        // Kernel rumble/LED reports: absorbed into the combined report while
-        // streaming (vds-style — no interleaved 0x31s on the interrupt
-        // channel), relayed directly while idle.
-        let jack_plugged = JACK_PLUGGED.load(Ordering::Relaxed);
-        if jack_plugged != jack_dbg {
-            eprintln!("sink: JACK_PLUGGED load -> {}", jack_plugged);
-            jack_dbg = jack_plugged;
-        }
-        if jack_plugged != was_jack {
-            eprintln!("sink: JACK_PLUGGED load -> {}", jack_plugged);
-            was_jack = jack_plugged;
-        }
-        let jack_path = if force_speaker { false } else { jack_plugged };
-        // Jack engage: answer every plug/unplug edge with a mic-state 0x31
-        // carrying the new path (works while idle too — the pad needs the
-        // ack even when no audio is streaming). Runs before the flush so
-        // the pad latches HP-detect before the next payload arrives.
-        if l2cap && engaged_jack != Some(jack_path) {
-            let ms = crate::audio::state_report(seq, &crate::l2cap::mic_state(jack_path));
-            seq = (seq + 1) & 0x0F;
-            if !(file.write_all(&[0xA2]).is_ok() && file.write_all(&ms).is_ok()) {
-                break;
-            }
-            eprintln!(
-                "sink: jack engage → {} (mic-state 0x31)",
-                if jack_path { "headset" } else { "speaker" }
-            );
-            engaged_jack = Some(jack_path);
-        }
-        // BT idle keep-alive: the pad powers off after a few minutes with
-        // no output traffic. While streaming, the 10 ms 0x36 cadence keeps
-        // it awake; while idle, re-assert a zero-flags 0x31 state report
-        // (applies nothing) every 2 s to reset the pad's sleep timer —
-        // the PC equivalent of the PS5's constant output stream.
-        if l2cap && !primed && keepalive.elapsed() >= Duration::from_millis(2000) {
-            keepalive = Instant::now();
-            let noop = crate::audio::state_report(seq, &[0u8; 47]);
-            seq = (seq + 1) & 0x0F;
-            if !(file.write_all(&[0xA2]).is_ok() && file.write_all(&noop).is_ok()) {
-                break;
-            }
-        }
-        if !flush_kernel_outputs(
-            file,
-            shared,
-            &mut seq,
-            &mut state,
-            &mut state63,
-            &mut last_state47,
-            hp_volume,
-            output,
-            jack_path,
-            primed,
-            combined,
-            l2cap,
-        ) {
-            break;
-        }
-        // Gather input until one output frame can be produced.
-        loop {
-            let need_samples = (in_pos + (FRAME_SAMPLES as f64) * ratio).ceil() as usize + 2;
-            if in_buf.len() / 4 >= need_samples {
-                break;
-            }
-            let got = {
-                let mut ring = shared.ring.lock().unwrap_or_else(|e| e.into_inner());
-                ring.pop_front()
-            };
-            match got {
-                Some(frame) => in_buf.extend_from_slice(&frame),
-                None => break,
-            }
-        }
-        if !primed {
-            let fill = {
-                let mut ring = shared.ring.lock().unwrap_or_else(|e| e.into_inner());
-                while ring.len() as i64 > TARGET_FILL_FRAMES {
-                    ring.pop_front(); // discard backlog (not an overflow)
+            let g = shared.gen.load(Ordering::Relaxed);
+            let fd = shared
+                .intr
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(fd) = fd {
+                if g != cur_gen {
+                    break (fd, g);
                 }
+            }
+            thread::sleep(Duration::from_millis(100));
+        };
+        cur_gen = gen;
+        let dup = unsafe { libc::dup(fd.as_raw_fd()) };
+        let mut file = unsafe { File::from_raw_fd(dup) };
+        // Fresh link: reset per-link state so a re-attached pad doesn't get
+        // stale buffered audio or jack/sequence state from the last link —
+        // but KEEP `state`/`state63`: they hold the game's last wanted
+        // output (adaptive-trigger effects, motors, lightbar), and the game
+        // does NOT re-send its effect configuration after a pad reconnect.
+        // Re-merging audio fields + zeroing `last_state47` makes change
+        // detection replay the full state as a standalone 0x31 right after
+        // the handshake, restoring trigger resistance on the new link.
+        merge_audio_state(&mut state, hp_volume, output, false);
+        sink_merge63(&mut state63, hp_volume, output, !force_speaker);
+        last_state47 = [0u8; 47];
+        mic_seq = 0;
+        in_pos = 0.0;
+        in_buf.clear();
+        seq = 0;
+        counter = 0;
+        next = Instant::now() + Duration::from_millis(500); // warm-up
+        keepalive = Instant::now();
+        was_jack = JACK_PLUGGED.load(Ordering::Relaxed);
+        jack_dbg = was_jack;
+        engaged_jack = None;
+        primed = false;
+        starved_frames = 0;
+        silent_windows = 0;
+        frames_sent = 0;
+        eprintln!("sink: writer attached to pad link (gen {gen})");
+        // Unlock audio immediately (before the first combined report).
+        if l2cap {
+            if !send_l2cap_handshake(&mut file, &mut seq, &mut mic_seq) {
+                eprintln!("sink: handshake failed (gen {gen}) — awaiting next link");
+                thread::sleep(Duration::from_millis(100));
+                continue 'pads;
+            }
+        } else if !send_volume_unlock(&mut file, &mut seq, &state) {
+            thread::sleep(Duration::from_millis(100));
+            continue 'pads;
+        }
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            // Periodic volume unlock (~2.7 s) is 0x35-hidraw-path only; vds sends
+            // the L2CAP mic handshake solely at stream start / re-prime, so the
+            // L2CAP path sends nothing extra here.
+            if !l2cap && frames_sent > 0 && frames_sent % 256 == 0 {
+                if !send_volume_unlock(&mut file, &mut seq, &state) {
+                    break;
+                }
+            }
+            // Kernel rumble/LED reports: absorbed into the combined report while
+            // streaming (vds-style — no interleaved 0x31s on the interrupt
+            // channel), relayed directly while idle.
+            let jack_plugged = JACK_PLUGGED.load(Ordering::Relaxed);
+            if jack_plugged != jack_dbg {
+                eprintln!("sink: JACK_PLUGGED load -> {}", jack_plugged);
+                jack_dbg = jack_plugged;
+            }
+            if jack_plugged != was_jack {
+                eprintln!("sink: JACK_PLUGGED load -> {}", jack_plugged);
+                was_jack = jack_plugged;
+            }
+            let jack_path = if force_speaker { false } else { jack_plugged };
+            // Jack engage: answer every plug/unplug edge with a mic-state 0x31
+            // carrying the new path (works while idle too — the pad needs the
+            // ack even when no audio is streaming). Runs before the flush so
+            // the pad latches HP-detect before the next payload arrives.
+            if l2cap && engaged_jack != Some(jack_path) {
+                let ms = crate::audio::state_report(seq, &crate::l2cap::mic_state(jack_path));
+                seq = (seq + 1) & 0x0F;
+                if !(file.write_all(&[0xA2]).is_ok() && file.write_all(&ms).is_ok()) {
+                    break;
+                }
+                eprintln!(
+                    "sink: jack engage → {} (mic-state 0x31)",
+                    if jack_path { "headset" } else { "speaker" }
+                );
+                engaged_jack = Some(jack_path);
+            }
+            // BT idle keep-alive: the pad powers off after a few minutes with
+            // no output traffic. While streaming, the 10 ms 0x36 cadence keeps
+            // it awake; while idle, re-assert a zero-flags 0x31 state report
+            // (applies nothing) every 2 s to reset the pad's sleep timer —
+            // the PC equivalent of the PS5's constant output stream.
+            if l2cap && !primed && keepalive.elapsed() >= Duration::from_millis(2000) {
+                keepalive = Instant::now();
+                let noop = crate::audio::state_report(seq, &[0u8; 47]);
+                seq = (seq + 1) & 0x0F;
+                if !(file.write_all(&[0xA2]).is_ok() && file.write_all(&noop).is_ok()) {
+                    break;
+                }
+            }
+            if !flush_kernel_outputs(
+                &mut file,
+                shared,
+                &mut seq,
+                &mut state,
+                &mut state63,
+                &mut last_state47,
+                hp_volume,
+                output,
+                jack_path,
+                primed,
+                combined,
+                l2cap,
+            ) {
+                break;
+            }
+            // Gather input until one output frame can be produced.
+            loop {
+                let need_samples = (in_pos + (FRAME_SAMPLES as f64) * ratio).ceil() as usize + 2;
+                if in_buf.len() / 4 >= need_samples {
+                    break;
+                }
+                let got = {
+                    let mut ring = shared.ring.lock().unwrap_or_else(|e| e.into_inner());
+                    ring.pop_front()
+                };
+                match got {
+                    Some(frame) => in_buf.extend_from_slice(&frame),
+                    None => break,
+                }
+            }
+            if !primed {
+                let fill = {
+                    let mut ring = shared.ring.lock().unwrap_or_else(|e| e.into_inner());
+                    while ring.len() as i64 > TARGET_FILL_FRAMES {
+                        ring.pop_front(); // discard backlog (not an overflow)
+                    }
+                    ring.len() as i64
+                };
+                if fill == 0 {
+                    // no real audio — send nothing; pad buffer drains meanwhile.
+                    // MUST sleep: `continue` skips the pacing sleep at the loop
+                    // bottom, and without this the idle writer hot-spins, choking
+                    // the out_q mutex the rumble relay contends on.
+                    starved_frames = 0;
+                    next = Instant::now() + Duration::from_millis(20);
+                    thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+                // vds parity: prime only on non-silent audio (see silence
+                // gate below) — priming on PipeWire's idle-silence frames
+                // would flood the pad with silent 0x36s and wreck its input
+                // cadence.
+                let peak = in_buf.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+                if l2cap && peak < silence_eps {
+                    in_buf.clear();
+                    in_pos = 0.0;
+                    next = Instant::now() + Duration::from_millis(20);
+                    thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+                primed = true;
+                starved_frames = 0;
+                eprintln!("sink: primed (ring fill {fill})");
+                // L2CAP re-prime: re-send mic-state + mic-open handshake (v28, same
+                // sequence as the start-of-stream handshake). The pad may have
+                // dropped the previous handshakes after draining its buffer.
+                if l2cap && !send_l2cap_handshake(&mut file, &mut seq, &mut mic_seq) {
+                    break;
+                }
+            }
+            let need_samples = (in_pos + (FRAME_SAMPLES as f64) * ratio).ceil() as usize + 2;
+            if in_buf.len() / 4 < need_samples {
+                // underrun: pad with silence, keep the clock running
+                starved_frames += 1;
+                if starved_frames > 30 {
+                    // ~320 ms with no data: go idle — stop feeding so the pad
+                    // buffer drains; re-prime when real audio returns
+                    primed = false;
+                    in_buf.clear();
+                    in_pos = 0.0;
+                    eprintln!("sink: idle (input starved — letting pad buffer drain)");
+                    continue;
+                }
+                UNDERRUNS.fetch_add(1, Ordering::Relaxed);
+                stat_underruns += 1;
+                in_buf.resize(need_samples * 4, 0.0);
+            } else {
+                starved_frames = 0;
+            }
+            let main_silent = in_buf.iter().all(|s| s.abs() < silence_eps);
+            // Silence gate (vds parity): skip the whole window when nothing
+            // real is in it — no 0x36 leaves the host during quiet/idle audio,
+            // which keeps the pad's input-report cadence clean (the pad bursts
+            // its 0x31s between constant 0x36s, and games reject that).
+            if l2cap && main_silent {
+                in_buf.clear();
+                in_pos = 0.0;
+                starved_frames = 0;
+                silent_windows += 1;
+                if silent_windows >= 30 {
+                    // ~320 ms of quiet: go idle — kernel outputs fall back to
+                    // plain 0x31s until real audio re-primes the stream.
+                    primed = false;
+                    silent_windows = 0;
+                    eprintln!("sink: idle (input silent — letting pad buffer drain)");
+                }
+                next += Duration::from_nanos(interval_ns);
+                let now = Instant::now();
+                if next > now {
+                    thread::sleep(next - now);
+                } else if now.duration_since(next) > Duration::from_millis(200) {
+                    next = now;
+                }
+                continue;
+            }
+            silent_windows = 0;
+            // Produce 480 resampled stereo samples (speaker path, ch0/1).
+            // speaker_output=forward/mute: the pad speaker path carries silence
+            // (the Opus TLV must stay a valid frame — haptics ride the same
+            // report); music goes out via the forward playback stream instead.
+            // Live-switchable: re-read the mode every window.
+            let pad_speaker = shared.mode.load(Ordering::Relaxed) == MODE_PAD;
+            for s in 0..FRAME_SAMPLES {
+                let i0 = in_pos.floor() as usize;
+                let frac = (in_pos - i0 as f64) as f32;
+                let l0 = in_buf[i0 * 4];
+                let l1 = in_buf[i0 * 4 + 4];
+                let r0 = in_buf[i0 * 4 + 1];
+                let r1 = in_buf[i0 * 4 + 5];
+                if pad_speaker {
+                    pcm[s * 2] = (lerp(l0, l1, frac).clamp(-1.0, 1.0) * 32767.0) as i16;
+                    pcm[s * 2 + 1] = (lerp(r0, r1, frac).clamp(-1.0, 1.0) * 32767.0) as i16;
+                } else {
+                    pcm[s * 2] = 0;
+                    pcm[s * 2 + 1] = 0;
+                }
+                in_pos += ratio;
+            }
+            let consumed_pairs = in_pos.floor() as usize;
+
+            // Haptics path (ch2/3): box-average the frames this output step
+            // consumed into 32 haptic frames (vds resample_haptics_pcm): group
+            // average → s16 → /256 → s8, interleaved L/R.
+            {
+                let n = consumed_pairs.min(in_buf.len() / 4);
+                for h in 0..32usize {
+                    let begin = h * n / 32;
+                    let end = ((h + 1) * n / 32).max(begin + 1);
+                    let mut lsum = 0i32;
+                    let mut rsum = 0i32;
+                    for j in begin..end.min(n) {
+                        lsum += (in_buf[j * 4 + 2].clamp(-1.0, 1.0) * 32767.0) as i32;
+                        rsum += (in_buf[j * 4 + 3].clamp(-1.0, 1.0) * 32767.0) as i32;
+                    }
+                    let count = (end.min(n) - begin.min(n)).max(1) as i32;
+                    let l = (lsum / count) / 256;
+                    let r = (rsum / count) / 256;
+                    hap[h * 2] = l.clamp(-128, 127) as i8 as u8;
+                    hap[h * 2 + 1] = r.clamp(-128, 127) as i8 as u8;
+                }
+            }
+            in_buf.drain(..consumed_pairs * 4);
+            in_pos -= consumed_pairs as f64;
+
+            // Haptics-only: no Opus TLV, no audio path selection — just the
+            // 0x12 PCM frame in a minimal 0x32 report.
+            let ok = if haptics_only {
+                let report = crate::audio::haptics_report_0x32(seq, counter, &hap);
+                counter = counter.wrapping_add(2);
+                wdump(&mut file, &report)
+            } else {
+                let mut frame = [0u8; 512];
+                let pcm_out: &[i16] = &pcm;
+                for s in pcm_out.iter() {
+                    peak_store(&PEAK_PCM, *s as f32 / 32768.0);
+                }
+                let Some(enc_ref) = enc.as_ref() else {
+                    break;
+                };
+                let n = unsafe {
+                    opus_encode(
+                        enc_ref.0,
+                        pcm_out.as_ptr(),
+                        FRAME_SAMPLES as libc::c_int,
+                        frame.as_mut_ptr(),
+                        512,
+                    )
+                };
+                if n <= 0 {
+                    eprintln!("sink: opus_encode failed ({n})");
+                    continue;
+                }
+                if n as usize != bytes_per_frame {
+                    // CBR must give a constant size; anything else means the pad will
+                    // misdecode. Log loudly, drop the frame (keep the cadence).
+                    eprintln!(
+                    "sink: encoder returned {n}B, expected {bytes_per_frame}B (CBR off?) — frame dropped"
+                );
+                    continue;
+                }
+                // Routing follows plug state: jack or speaker per config.
+                let jack = jack_path;
+                if jack != was_jack {
+                    eprintln!(
+                        "sink: routing → {}",
+                        if jack { "headset jack" } else { "speaker" }
+                    );
+                    was_jack = jack;
+                }
+                // Re-assert audio state incl. path-select for this frame's routing.
+                if l2cap {
+                    sink_merge63(&mut state63, hp_volume, output, jack);
+                    let mut f200 = [0u8; 200];
+                    f200[..n as usize].copy_from_slice(&frame[..n as usize]);
+                    let report = crate::audio::audio_report_036_bt(
+                        seq, counter, &state63, &hap, &f200, jack,
+                    );
+                    counter = counter.wrapping_add(1);
+                    // Wire = HIDP prefix 0xA2 + raw report.
+                    let mut wire = Vec::with_capacity(report.len() + 1);
+                    wire.push(0xA2);
+                    wire.extend_from_slice(&report);
+                    wdump(&mut file, &wire)
+                } else {
+                    merge_audio_state(&mut state, hp_volume, output, jack);
+                    if combined {
+                        let report = audio_report_0x36(
+                            seq,
+                            counter,
+                            &state,
+                            &hap,
+                            &frame[..n as usize],
+                            jack,
+                        );
+                        counter = counter.wrapping_add(1);
+                        wdump(&mut file, &report)
+                    } else {
+                        let mut f200 = [0u8; 200];
+                        f200.copy_from_slice(&frame[..n as usize]);
+                        let report = match report_id {
+                            0x39 => crate::audio::audio_report_0x39(seq, counter, &f200, jack),
+                            _ => crate::audio::audio_report(seq, counter, &f200, jack),
+                        };
+                        counter = counter.wrapping_add(2);
+                        wdump(&mut file, &report)
+                    }
+                }
+            };
+            if !ok {
+                eprintln!("sink: write failed — pad gone?");
+                break;
+            }
+            seq = (seq + 1) & 0x0F;
+            if l2cap {
+                // this 0x36 delivered the tracked state — update the mirror
+                last_state47.copy_from_slice(&state63[..47]);
+            }
+
+            // Pace: configurable interval (default 10667 µs), gently steered by
+            // ring fill. Low gain: the spec's sweep shows ±tens of µs matters,
+            // so correct drift slowly instead of chasing per-quantum sawtooth.
+            let fill = {
+                let ring = shared.ring.lock().unwrap_or_else(|e| e.into_inner());
                 ring.len() as i64
             };
-            if fill == 0 {
-                // no real audio — send nothing; pad buffer drains meanwhile.
-                // MUST sleep: `continue` skips the pacing sleep at the loop
-                // bottom, and without this the idle writer hot-spins, choking
-                // the out_q mutex the rumble relay contends on.
-                starved_frames = 0;
-                next = Instant::now() + Duration::from_millis(20);
-                thread::sleep(Duration::from_millis(20));
-                continue;
-            }
-            // vds parity: prime only on non-silent audio (see silence
-            // gate below) — priming on PipeWire's idle-silence frames
-            // would flood the pad with silent 0x36s and wreck its input
-            // cadence.
-            let peak = in_buf.iter().fold(0.0f32, |m, s| m.max(s.abs()));
-            if l2cap && peak < silence_eps {
-                in_buf.clear();
-                in_pos = 0.0;
-                next = Instant::now() + Duration::from_millis(20);
-                thread::sleep(Duration::from_millis(20));
-                continue;
-            }
-            primed = true;
-            starved_frames = 0;
-            eprintln!("sink: primed (ring fill {fill})");
-            // L2CAP re-prime: re-send mic-state + mic-open handshake (v28, same
-            // sequence as the start-of-stream handshake). The pad may have
-            // dropped the previous handshakes after draining its buffer.
-            if l2cap && !send_l2cap_handshake(file, &mut seq, &mut mic_seq) {
-                break;
-            }
-        }
-        let need_samples = (in_pos + (FRAME_SAMPLES as f64) * ratio).ceil() as usize + 2;
-        if in_buf.len() / 4 < need_samples {
-            // underrun: pad with silence, keep the clock running
-            starved_frames += 1;
-            if starved_frames > 30 {
-                // ~320 ms with no data: go idle — stop feeding so the pad
-                // buffer drains; re-prime when real audio returns
-                primed = false;
-                in_buf.clear();
-                in_pos = 0.0;
-                eprintln!("sink: idle (input starved — letting pad buffer drain)");
-                continue;
-            }
-            UNDERRUNS.fetch_add(1, Ordering::Relaxed);
-            stat_underruns += 1;
-            in_buf.resize(need_samples * 4, 0.0);
-        } else {
-            starved_frames = 0;
-        }
-        let main_silent = in_buf.iter().all(|s| s.abs() < silence_eps);
-        // Silence gate (vds parity): skip the whole window when nothing
-        // real is in it — no 0x36 leaves the host during quiet/idle audio,
-        // which keeps the pad's input-report cadence clean (the pad bursts
-        // its 0x31s between constant 0x36s, and games reject that).
-        if l2cap && main_silent {
-            in_buf.clear();
-            in_pos = 0.0;
-            starved_frames = 0;
-            silent_windows += 1;
-            if silent_windows >= 30 {
-                // ~320 ms of quiet: go idle — kernel outputs fall back to
-                // plain 0x31s until real audio re-primes the stream.
-                primed = false;
-                silent_windows = 0;
-                eprintln!("sink: idle (input silent — letting pad buffer drain)");
-            }
-            next += Duration::from_nanos(interval_ns);
+            stat_fill_min = stat_fill_min.min(fill);
+            stat_fill_max = stat_fill_max.max(fill);
+            let err = fill - TARGET_FILL_FRAMES;
+            // Gentle steering on every transport: keeps the metronom glued to
+            // the PipeWire production clock (fill error → ±tens of µs), which
+            // also absorbs scheduler jitter. Flat pacing accumulates any
+            // production/consumption mismatch until the pad drops frames.
+            let adj = (interval_ns as i64 - err * 3_000).max(9_000_000);
+            next += Duration::from_nanos(adj as u64);
             let now = Instant::now();
             if next > now {
                 thread::sleep(next - now);
             } else if now.duration_since(next) > Duration::from_millis(200) {
-                next = now;
+                next = now; // way behind: resync
             }
-            continue;
-        }
-        silent_windows = 0;
-        // Produce 480 resampled stereo samples (speaker path, ch0/1).
-        // speaker_output=forward/mute: the pad speaker path carries silence
-        // (the Opus TLV must stay a valid frame — haptics ride the same
-        // report); music goes out via the forward playback stream instead.
-        for s in 0..FRAME_SAMPLES {
-            let i0 = in_pos.floor() as usize;
-            let frac = (in_pos - i0 as f64) as f32;
-            let l0 = in_buf[i0 * 4];
-            let l1 = in_buf[i0 * 4 + 4];
-            let r0 = in_buf[i0 * 4 + 1];
-            let r1 = in_buf[i0 * 4 + 5];
-            if pad_speaker {
-                pcm[s * 2] = (lerp(l0, l1, frac).clamp(-1.0, 1.0) * 32767.0) as i16;
-                pcm[s * 2 + 1] = (lerp(r0, r1, frac).clamp(-1.0, 1.0) * 32767.0) as i16;
-            } else {
-                pcm[s * 2] = 0;
-                pcm[s * 2 + 1] = 0;
-            }
-            in_pos += ratio;
-        }
-        let consumed_pairs = in_pos.floor() as usize;
 
-        // Haptics path (ch2/3): box-average the frames this output step
-        // consumed into 32 haptic frames (vds resample_haptics_pcm): group
-        // average → s16 → /256 → s8, interleaved L/R.
-        {
-            let n = consumed_pairs.min(in_buf.len() / 4);
-            for h in 0..32usize {
-                let begin = h * n / 32;
-                let end = ((h + 1) * n / 32).max(begin + 1);
-                let mut lsum = 0i32;
-                let mut rsum = 0i32;
-                for j in begin..end.min(n) {
-                    lsum += (in_buf[j * 4 + 2].clamp(-1.0, 1.0) * 32767.0) as i32;
-                    rsum += (in_buf[j * 4 + 3].clamp(-1.0, 1.0) * 32767.0) as i32;
-                }
-                let count = (end.min(n) - begin.min(n)).max(1) as i32;
-                let l = (lsum / count) / 256;
-                let r = (rsum / count) / 256;
-                hap[h * 2] = l.clamp(-128, 127) as i8 as u8;
-                hap[h * 2 + 1] = r.clamp(-128, 127) as i8 as u8;
-            }
-        }
-        in_buf.drain(..consumed_pairs * 4);
-        in_pos -= consumed_pairs as f64;
-
-        // Haptics-only: no Opus TLV, no audio path selection — just the
-        // 0x12 PCM frame in a minimal 0x32 report.
-        let ok = if haptics_only {
-            let report = crate::audio::haptics_report_0x32(seq, counter, &hap);
-            counter = counter.wrapping_add(2);
-            wdump(file, &report)
-        } else {
-            let mut frame = [0u8; 512];
-            let pcm_out: &[i16] = &pcm;
-            for s in pcm_out.iter() {
-                peak_store(&PEAK_PCM, *s as f32 / 32768.0);
-            }
-            let Some(enc_ref) = enc.as_ref() else {
-                break;
-            };
-            let n = unsafe {
-                opus_encode(
-                    enc_ref.0,
-                    pcm_out.as_ptr(),
-                    FRAME_SAMPLES as libc::c_int,
-                    frame.as_mut_ptr(),
-                    512,
-                )
-            };
-            if n <= 0 {
-                eprintln!("sink: opus_encode failed ({n})");
-                continue;
-            }
-            if n as usize != bytes_per_frame {
-                // CBR must give a constant size; anything else means the pad will
-                // misdecode. Log loudly, drop the frame (keep the cadence).
+            // Periodic health stats (~5.4 s window).
+            stat_frames += 1;
+            frames_sent += 1;
+            if stat_frames >= 512 {
+                stat_frames = 0;
+                let un = UNDERRUNS.load(Ordering::Relaxed);
+                let ov = OVERFLOWS.load(Ordering::Relaxed);
+                let pin = f32::from_bits(PEAK_IN.swap(0, Ordering::Relaxed));
+                let ppm = f32::from_bits(PEAK_PCM.swap(0, Ordering::Relaxed));
                 eprintln!(
-                    "sink: encoder returned {n}B, expected {bytes_per_frame}B (CBR off?) — frame dropped"
-                );
-                continue;
-            }
-            // Routing follows plug state: jack or speaker per config.
-            let jack = jack_path;
-            if jack != was_jack {
-                eprintln!(
-                    "sink: routing → {}",
-                    if jack { "headset jack" } else { "speaker" }
-                );
-                was_jack = jack;
-            }
-            // Re-assert audio state incl. path-select for this frame's routing.
-            if l2cap {
-                sink_merge63(&mut state63, hp_volume, output, jack);
-                let mut f200 = [0u8; 200];
-                f200[..n as usize].copy_from_slice(&frame[..n as usize]);
-                let report =
-                    crate::audio::audio_report_036_bt(seq, counter, &state63, &hap, &f200, jack);
-                counter = counter.wrapping_add(1);
-                // Wire = HIDP prefix 0xA2 + raw report.
-                let mut wire = Vec::with_capacity(report.len() + 1);
-                wire.push(0xA2);
-                wire.extend_from_slice(&report);
-                wdump(file, &wire)
-            } else {
-                merge_audio_state(&mut state, hp_volume, output, jack);
-                if combined {
-                    let report =
-                        audio_report_0x36(seq, counter, &state, &hap, &frame[..n as usize], jack);
-                    counter = counter.wrapping_add(1);
-                    wdump(file, &report)
-                } else {
-                    let mut f200 = [0u8; 200];
-                    f200.copy_from_slice(&frame[..n as usize]);
-                    let report = match report_id {
-                        0x39 => crate::audio::audio_report_0x39(seq, counter, &f200, jack),
-                        _ => crate::audio::audio_report(seq, counter, &f200, jack),
-                    };
-                    counter = counter.wrapping_add(2);
-                    wdump(file, &report)
-                }
-            }
-        };
-        if !ok {
-            eprintln!("sink: write failed — pad gone?");
-            break;
-        }
-        seq = (seq + 1) & 0x0F;
-        if l2cap {
-            // this 0x36 delivered the tracked state — update the mirror
-            last_state47.copy_from_slice(&state63[..47]);
-        }
-
-        // Pace: configurable interval (default 10667 µs), gently steered by
-        // ring fill. Low gain: the spec's sweep shows ±tens of µs matters,
-        // so correct drift slowly instead of chasing per-quantum sawtooth.
-        let fill = {
-            let ring = shared.ring.lock().unwrap_or_else(|e| e.into_inner());
-            ring.len() as i64
-        };
-        stat_fill_min = stat_fill_min.min(fill);
-        stat_fill_max = stat_fill_max.max(fill);
-        let err = fill - TARGET_FILL_FRAMES;
-        // Gentle steering on every transport: keeps the metronom glued to
-        // the PipeWire production clock (fill error → ±tens of µs), which
-        // also absorbs scheduler jitter. Flat pacing accumulates any
-        // production/consumption mismatch until the pad drops frames.
-        let adj = (interval_ns as i64 - err * 3_000).max(9_000_000);
-        next += Duration::from_nanos(adj as u64);
-        let now = Instant::now();
-        if next > now {
-            thread::sleep(next - now);
-        } else if now.duration_since(next) > Duration::from_millis(200) {
-            next = now; // way behind: resync
-        }
-
-        // Periodic health stats (~5.4 s window).
-        stat_frames += 1;
-        frames_sent += 1;
-        if stat_frames >= 512 {
-            stat_frames = 0;
-            let un = UNDERRUNS.load(Ordering::Relaxed);
-            let ov = OVERFLOWS.load(Ordering::Relaxed);
-            let pin = f32::from_bits(PEAK_IN.swap(0, Ordering::Relaxed));
-            let ppm = f32::from_bits(PEAK_PCM.swap(0, Ordering::Relaxed));
-            eprintln!(
                 "sink: stats fill {fill} (min {} max {}), underruns +{} ({} total), overflows +{} ({} total), peak in {pin:.3} pcm {ppm:.3}",
                 if stat_fill_min == i64::MAX { -1 } else { stat_fill_min },
                 stat_fill_max,
@@ -1612,11 +1928,16 @@ fn writer_thread(
                 ov.saturating_sub(stat_overflows),
                 ov,
             );
-            stat_underruns = un;
-            stat_overflows = ov;
-            stat_fill_min = i64::MAX;
-            stat_fill_max = 0;
+                stat_underruns = un;
+                stat_overflows = ov;
+                stat_fill_min = i64::MAX;
+                stat_fill_max = 0;
+            }
         }
+        // Inner loop broke: write failure = pad link dead. Keep the sink
+        // node alive for the game, drop the fd, wait for the next attach.
+        eprintln!("sink: pad link down (gen {gen}) — sink stays up, awaiting re-attach");
+        thread::sleep(Duration::from_millis(50));
     }
     let _ = OUT_RELAY.lock().unwrap_or_else(|e| e.into_inner()).take();
     eprintln!("sink: writer exited");

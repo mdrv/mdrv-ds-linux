@@ -48,11 +48,24 @@ pub struct Config {
     pub audio: AudioConfig,
     #[serde(default)]
     pub input: InputConfig,
+    /// XInput pad emulation: expose a SECOND virtual pad (Xbox 360 wired,
+    /// 045e:028e) translated from the live DualSense stream so XInput-only
+    /// games work under wine/Proton without Steam Input. Strictly additive:
+    /// a separate holder instance owns the device; the DS-native path is
+    /// untouched. Default false; live-toggle via `mdrv-ds xinput on|off|reset`.
+    #[serde(default)]
+    pub xinput: Option<bool>,
 }
 
 impl Config {
     pub fn l2cap(&self) -> bool {
         self.transport.as_deref() == Some("l2cap")
+    }
+
+    /// True when XInput emulation is enabled by config (the runtime
+    /// override file can still flip it live — see xinput::effective).
+    pub fn xinput(&self) -> bool {
+        self.xinput.unwrap_or(false)
     }
 
     /// True when force_bus asks for a USB-presented virtual pad.

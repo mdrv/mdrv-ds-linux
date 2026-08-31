@@ -186,6 +186,7 @@ struct ChordState {
 
 /// Analog-trigger press threshold (0-255); released rests at 0.
 const TRIG_THRESHOLD: u8 = 0x40;
+const TRIG_RELEASE: u8 = 0x30;
 
 /// How long PS must be held solo before [ps] hold fires.
 const PS_HOLD_SECS: u64 = 3;
@@ -224,10 +225,23 @@ impl ChordState {
         let mut toggle_ps = None;
         let ps_down = report[l.btn0 + 2] & 0x01 != 0;
         for (i, (name, byte, bit, cmd)) in self.bindings.iter().enumerate() {
-            // L2/R2 are analog (no digital bit): pressed = value over threshold
+            // L2/R2 are analog (no digital bit): pressed = value over threshold.
+            // Hysteresis: a held trigger hovering near the threshold must not
+            // flap pressed/released and re-fire the chord — release only under
+            // the lower threshold once latched.
             let pressed = match *byte {
-                config::TRIG_L2 => report.get(l.trig0).is_some_and(|&v| v > TRIG_THRESHOLD),
-                config::TRIG_R2 => report.get(l.trig0 + 1).is_some_and(|&v| v > TRIG_THRESHOLD),
+                config::TRIG_L2 => {
+                    let prev = self.prev_pressed[i];
+                    report
+                        .get(l.trig0)
+                        .is_some_and(|&v| v > if prev { TRIG_RELEASE } else { TRIG_THRESHOLD })
+                }
+                config::TRIG_R2 => {
+                    let prev = self.prev_pressed[i];
+                    report
+                        .get(l.trig0 + 1)
+                        .is_some_and(|&v| v > if prev { TRIG_RELEASE } else { TRIG_THRESHOLD })
+                }
                 // d-pad hats: compass nibble, pressed = direction active
                 config::HAT_UP => crate::audiobridge::hat_dirs(report[l.btn0] & 0x0f)[0],
                 config::HAT_DOWN => crate::audiobridge::hat_dirs(report[l.btn0] & 0x0f)[2],
@@ -591,6 +605,26 @@ fn neutral_report(l: &InputLayout) -> Option<Vec<u8>> {
     Some(r)
 }
 
+/// Best-effort suite toast: `notif {json}` line on the overlay's notify
+/// socket ($XDG_RUNTIME_DIR/mdrv-ds-notify.sock — protocol per mdrv-ds-notify;
+/// rendered by the overlay daemon). Fixed ASCII payloads only, so no JSON
+/// escaping is needed. Silent when the overlay is down.
+fn pad_toast(summary: &str, body: &str) {
+    use std::io::Write as _;
+    let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") else { return };
+    let path = std::path::Path::new(&dir).join("mdrv-ds-notify.sock");
+    let Ok(mut s) = std::os::unix::net::UnixStream::connect(&path) else {
+        return;
+    };
+    let _ = s.set_write_timeout(Some(std::time::Duration::from_millis(300)));
+    let line = format!(
+        "notif {{\"app\":\"mdrv-ds\",\"summary\":\"{summary}\",\"body\":\"{body}\",\"icon\":\"\",\"timeout_ms\":2500}}\n",
+    );
+    if s.write_all(line.as_bytes()).is_err() {
+        eprintln!("notify: toast submit failed");
+    }
+}
+
 pub fn run(opts: ProxyOpts) -> i32 {
     install_signal_handlers();
     tee_stderr_to_file("proxy.log");
@@ -789,6 +823,14 @@ pub fn run(opts: ProxyOpts) -> i32 {
         let neutral = neutral_report(&layout).unwrap_or_default();
         let _ = ipc::send(&mut sock, ipc::TAG_NEUTRAL, &neutral);
 
+        // XInput emulation (default OFF): raise the second virtual pad
+        // only when enabled (config + live override). Strictly additive —
+        // the DS path above is untouched; disabled means nothing spawns.
+        let mut xi = XiRelay::none();
+        if crate::xinput::effective(cfg.xinput()) {
+            xi.raise(&virtual_mac);
+        }
+
         // Device nodes to hide: the real hidraw + every evdev node (event*/js*)
         // under its HID device. Bind-mounting /dev/null makes future open()s
         // fail/EOF, so games can only see the virtual pad. We already hold the
@@ -877,11 +919,28 @@ pub fn run(opts: ProxyOpts) -> i32 {
         }
 
         // Phase-2 BT audio: PipeWire sink → Opus ladder (speaker/jack).
-        if let Some(s) = audio_sink.as_mut() {
+        // L2CAP: the sink is a process-lifetime resource — pad sessions
+        // attach/detach their link fd without ever destroying the node, so
+        // games never lose the 4ch haptics endpoint on a pad reconnect
+        // (RE Engine never re-commits AudioClient_Initialize mid-run).
+        // Legacy hidraw transport keeps the old session-scoped sink.
+        if session_is_l2cap
+            && info.product != crate::hid::PRODUCT_DS4
+            && cfg.audio.sink != Some(false)
+        {
+            audio_sink = Some(sink::ensure_started(&cfg.audio));
+            if sink::attach_pad(real.as_raw_fd()) {
+                eprintln!("sink: pad link attached (persistent node)");
+            }
+            follow_pad_sink(false);
+        } else if let Some(s) = audio_sink.as_mut() {
             s.stop();
+            audio_sink = None;
+        } else {
+            audio_sink = None;
         }
-        audio_sink = None;
         if matches!(info.transport, Transport::Bluetooth)
+            && !session_is_l2cap
             && info.product != crate::hid::PRODUCT_DS4
             && cfg.audio.sink != Some(false)
         {
@@ -889,10 +948,18 @@ pub fn run(opts: ProxyOpts) -> i32 {
                 &real,
                 &cfg.audio,
                 &hid::feature_lengths(&info.rdesc),
-                ctrl.is_some(),
+                false,
             ));
             follow_pad_sink(false);
         }
+
+        // Suite toast: pad session fully established (pads + sink + gate).
+        let pad_name = if info.product == crate::hid::PRODUCT_DS4 {
+            "DualShock 4"
+        } else {
+            "DualSense"
+        };
+        pad_toast(&format!("{pad_name} connected"), info.transport.name());
 
         let code = relay_loop(
             &mut real,
@@ -909,8 +976,19 @@ pub fn run(opts: ProxyOpts) -> i32 {
             usb_view,
             cfg.swap_cross_circle.unwrap_or(false),
             l2cap_features.as_mut(),
+            &mut xi,
         );
         eprintln!("teardown: relay loop returned (pad fd closed or exit requested)");
+        if code != 3 {
+            // 3 = holder recreate — the pad link itself stays up; no toast.
+            pad_toast(&format!("{pad_name} disconnected"), "");
+        }
+        // Persistent sink: release the pad link but keep the node alive so
+        // the game's audio endpoint survives into the next pad session.
+        if session_is_l2cap {
+            sink::detach_pad();
+            eprintln!("sink: pad link detached (node stays up)");
+        }
         // Undo the real pad's node masking; the virtual pad itself is owned
         // by the holder and outlives this proxy process.
         for n in &hidden {
@@ -918,6 +996,7 @@ pub fn run(opts: ProxyOpts) -> i32 {
         }
         eprintln!("teardown: hidraw unmounts done");
         drop(sock); // holder emits the stored neutral report on this EOF
+        drop(xi); // xi holder replays its stored neutral on this EOF
         if EXIT.load(Ordering::Relaxed) || code == 2 {
             eprintln!("proxy: exit (virtual pad kept alive by holder)");
             if let Some(t) = tone.as_mut() {
@@ -1045,6 +1124,7 @@ fn follow_pad_sink(usb: bool) {
 }
 
 fn proxy_exit(tone: &mut Option<audio::Tone>, audio_sink: &mut Option<sink::Sink>) -> i32 {
+    sink::stop_all(); // persistent sink: stub handles can't stop it
     eprintln!("proxy: exit (virtual pad kept alive by holder)");
     if let Some(t) = tone.as_mut() {
         t.stop();
@@ -1086,6 +1166,65 @@ fn open_real(explicit: &Option<String>) -> OpenReal {
     }
 }
 
+/// Second virtual pad relay (XInput emulation; see xinput.rs). Owned by
+/// the relay loop; `sock: None` = disabled — nothing spawned, nothing
+/// polled, zero interaction with the DS-native path.
+struct XiRelay {
+    sock: Option<UnixStream>,
+}
+
+impl XiRelay {
+    fn none() -> Self {
+        XiRelay { sock: None }
+    }
+
+    /// Connect to the xi holder (spawning it detached if needed), create
+    /// the Xbox 360 pad and arm its neutral report. The holder keeps the
+    /// pad across proxy restarts exactly like the DS holder does.
+    fn raise(&mut self, virtual_mac: &[u8; 6]) {
+        if self.sock.is_some() {
+            return;
+        }
+        let mut s = match ipc::ensure_holder_for("xi") {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("xinput: holder unavailable: {e}");
+                return;
+            }
+        };
+        let msg = crate::xinput::create_msg(virtual_mac);
+        if ipc::send(&mut s, ipc::TAG_CREATE, &ipc::encode_create(&msg)).is_err() {
+            eprintln!("xinput: create send failed");
+            return;
+        }
+        // Frame order is preserved — the neutral arms before any input
+        // report can arrive, exactly like the DS path.
+        let n = crate::xinput::neutral();
+        let _ = ipc::send(&mut s, ipc::TAG_NEUTRAL, &n);
+        eprintln!("xinput: Xbox 360 pad raised (uniq {})", msg.uniq);
+        self.sock = Some(s);
+    }
+
+    /// Live-disable: destroy the pad (holder resets its create key) and
+    /// drop the link. Safe to call repeatedly.
+    fn lower(&mut self) {
+        if let Some(mut s) = self.sock.take() {
+            let _ = ipc::send(&mut s, ipc::TAG_DESTROY, &[]);
+            eprintln!("xinput: Xbox 360 pad destroyed (live disable)");
+        }
+    }
+
+    /// Park the kernel state at neutral without dropping the link (overlay
+    /// hold: the DS report stream stops here; a frozen xpad state would
+    /// leave stuck buttons/sticks in XInput games).
+    fn park_neutral(&mut self) {
+        if let Some(s) = self.sock.as_mut() {
+            let n = crate::xinput::neutral();
+            let _ = ipc::send(s, ipc::TAG_INPUT, &n);
+        }
+    }
+}
+
 fn relay_loop(
     real: &mut File,
     // L2CAP control channel (PSM 0x11); polled and drained for the whole
@@ -1103,6 +1242,7 @@ fn relay_loop(
     usb_view: bool,
     swap_ox: bool,
     mut features: Option<&mut std::collections::HashMap<u8, Vec<u8>>>,
+    xi: &mut XiRelay,
 ) -> i32 {
     // The virtual pad carries the transport's NATIVE descriptor on L2CAP
     // (BT presentation — see run()), so everything downstream speaks the
@@ -1150,6 +1290,11 @@ fn relay_loop(
             .ok()
             .map(|f| (f, 0usize))
     });
+    // Post-arbitration hold-break: after the overlay (hold client) closes
+    // or the gate file releases, keep swallowing frames until every button
+    // is up, so the closing press (e.g. cross) never reaches the game.
+    let mut pause_break = false;
+    let mut gate_break = false;
     let mut eofs: u32 = 0;
     // Output-log dedup: kernel state workers resend identical 0x02 output
     // reports in high-frequency bursts (mute-LED worker: ~25/s observed).
@@ -1179,6 +1324,9 @@ fn relay_loop(
 
     loop {
         let now = std::time::Instant::now();
+        // fd < 0 makes poll(2) ignore the entry (POSIX) — used when no
+        // ctrl channel or the XInput tap is down.
+        let xi_fd = xi.sock.as_ref().map(|s| s.as_raw_fd()).unwrap_or(-1);
         let mut fds = [
             libc::pollfd {
                 fd: real_fd,
@@ -1192,6 +1340,11 @@ fn relay_loop(
             },
             libc::pollfd {
                 fd: ctrl_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: xi_fd,
                 events: libc::POLLIN,
                 revents: 0,
             },
@@ -1209,14 +1362,26 @@ fn relay_loop(
             );
             *ps_swallow = cfg.ps.swallow();
             *stick_dz = cfg.input;
+            let mode = sink::current_mode(cfg.audio.speaker_output.as_deref());
+            let live = sink::set_speaker_mode(mode);
             eprintln!(
-                "config reloaded: {} chord(s), ps={}, sticks(enabled={}, inner={:.2}, outer={:.2})",
+                "config reloaded: {} chord(s), ps={}, sticks(enabled={}, inner={:.2}, outer={:.2}), speaker={}{}",
                 chords.bindings.len(),
                 if *ps_swallow { "swallow" } else { "pass" },
                 stick_dz.enabled,
                 stick_dz.inner_dz,
-                stick_dz.outer_dz
+                stick_dz.outer_dz,
+                sink::mode_name(mode),
+                if live { " (live)" } else { "" }
             );
+            // XInput emulation live-switch (override file + SIGHUP):
+            // raise or tear down the second virtual pad in place.
+            let want_xi = crate::xinput::effective(cfg.xinput());
+            if want_xi && xi.sock.is_none() {
+                xi.raise(virtual_mac);
+            } else if !want_xi && xi.sock.is_some() {
+                xi.lower();
+            }
         }
         let timeout_ms: i32 = 250;
         let ret = uhid::poll(&mut fds, timeout_ms);
@@ -1392,11 +1557,44 @@ fn relay_loop(
                     }
                     // Overlay (hold client) open: the game gets nothing.
                     if crate::audiobridge::paused() {
+                        if !pause_break {
+                            if input_dbg() {
+                                eprintln!("in: paused engage (overlay hold) — dropping frames");
+                            }
+                            // Park the XInput pad at neutral — its report
+                            // stream stops here and a frozen xpad state
+                            // would stick in XInput games.
+                            xi.park_neutral();
+                        }
+                        pause_break = true;
                         continue;
                     }
+                    if pause_break {
+                        if buttons_live(&report, &layout) {
+                            continue;
+                        }
+                        pause_break = false;
+                        if input_dbg() {
+                            eprintln!("in: pause released (pad neutral)");
+                        }
+                    }
                     if gate.load(Ordering::Relaxed) {
+                        if !gate_break && input_dbg() {
+                            eprintln!("in: gate engage (focus file)");
+                        }
+                        gate_break = true;
                         gate_input(&mut report, &layout);
                     } else {
+                        if gate_break {
+                            if buttons_live(&report, &layout) {
+                                gate_input(&mut report, &layout);
+                            } else {
+                                gate_break = false;
+                                if input_dbg() {
+                                    eprintln!("in: gate released (pad neutral)");
+                                }
+                            }
+                        }
                         if stick_dz.enabled {
                             scale_sticks(
                                 &mut report,
@@ -1417,6 +1615,21 @@ fn relay_loop(
                         }
                         last_fwd = now;
                     }
+                    // XInput tap: translate the same post-processed
+                    // report (chimera translation, chords, PS swallow,
+                    // gate and deadzones all applied above) into the xpad
+                    // packet for the second virtual pad. Tap errors never
+                    // touch the DS session — the tap just goes dark.
+                    if xi.sock.is_some() {
+                        let mut xsock = xi.sock.take().unwrap();
+                        let xr = crate::xinput::translate(&report, &layout);
+                        if ipc::send(&mut xsock, ipc::TAG_INPUT, &xr).is_err() {
+                            eprintln!("xinput: holder link lost — tap disabled until reload");
+                        } else {
+                            xi.sock = Some(xsock);
+                        }
+                    }
+
                     if ipc::send(sock, ipc::TAG_INPUT, &report).is_err() {
                         return 3;
                     }
@@ -1801,6 +2014,69 @@ fn relay_loop(
             return 3;
         }
 
+        // XInput holder link: rumble + control-plane replies. Any error
+        // here only disables the tap until the next reload — never the
+        // DS relay.
+        if fds[3].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 && xi.sock.is_some()
+        {
+            let mut xs = xi.sock.take().unwrap();
+            match ipc::recv(&mut xs) {
+                Ok((ipc::TAG_OUTPUT, data)) => {
+                    if let Some((strong, weak)) = crate::xinput::decode_rumble(&data) {
+                        if !sink::rumble(strong, weak) {
+                            // USB DualSense: no sink — write the 48 B 0x02
+                            // output report directly, like a game would.
+                            // (DS4 sessions have no DS5-shaped output path;
+                            // rumble there stays on the DS side.)
+                            if info.transport == Transport::Usb
+                                && info.product == crate::hid::PRODUCT_DUALSENSE
+                            {
+                                let _ = real.write_all(&crate::xinput::rumble_report(strong, weak));
+                            } else {
+                                eprintln!("xinput: rumble dropped (no sink)");
+                            }
+                        }
+                    } // LED packets and other non-rumble writes: swallowed
+                    xi.sock = Some(xs);
+                }
+                Ok((ipc::TAG_CREATE_ACK, a)) => {
+                    if a.first() == Some(&2) {
+                        eprintln!(
+                            "xinput: create failed: {}",
+                            String::from_utf8_lossy(&a[1..])
+                        );
+                    }
+                    xi.sock = Some(xs);
+                }
+                Ok((ipc::TAG_GET_REQ, p)) => {
+                    if let Some((id, _)) = ipc::dec_req(&p) {
+                        let _ = ipc::send(
+                            &mut xs,
+                            ipc::TAG_GET_REPLY,
+                            &ipc::enc_get_reply(id, libc::EINVAL as u16, &[]),
+                        );
+                    }
+                    xi.sock = Some(xs);
+                }
+                Ok((ipc::TAG_SET_REQ, p)) => {
+                    if let Some((id, _, _)) = ipc::dec_set_req(&p) {
+                        let _ = ipc::send(&mut xs, ipc::TAG_SET_ACK, &ipc::enc_ack(id, 0));
+                    }
+                    xi.sock = Some(xs);
+                }
+                Ok((ipc::TAG_NOTICE, m)) => {
+                    eprintln!("xinput holder: {}", String::from_utf8_lossy(&m));
+                    xi.sock = Some(xs);
+                }
+                Ok(_) => {
+                    xi.sock = Some(xs);
+                }
+                Err(e) => {
+                    eprintln!("xinput: holder link error ({e}) — tap disabled until reload");
+                }
+            }
+        }
+
         // L2CAP control channel: keep it drained for the whole session
         // (vds handle_bt_control): every 0xA3 frame is cached — unprompted
         // too — so later GET_REQs are served fresh; other frames logged.
@@ -1855,6 +2131,25 @@ fn relay_loop(
 
 /// Neutralize gameplay fields (sticks, triggers, buttons) while gate is active.
 /// Trigger analog bytes sit at stick0+4/stick0+5 within the 6-axis block.
+/// Any face/shoulder button down (hat nibble excluded) or a trigger past
+/// the idle threshold — used by the hold-break so the frame that closes
+/// the overlay doesn't surface in-game as a fresh press.
+fn input_dbg() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("MDRV_INPUT_DEBUG").as_deref() == Ok("1"))
+}
+
+fn buttons_live(report: &[u8], l: &InputLayout) -> bool {
+    if report.len() < l.btn0 + 3 {
+        return false;
+    }
+    if report[l.btn0] & 0xF0 != 0 || report[l.btn0 + 1] != 0 || report[l.btn0 + 2] != 0 {
+        return true;
+    }
+    // triggers: L2/R2 live at stick0+4/+5
+    report.len() >= l.stick0 + 6 && (report[l.stick0 + 4] > 0x10 || report[l.stick0 + 5] > 0x10)
+}
+
 fn gate_input(report: &mut [u8], l: &InputLayout) {
     if report.len() < l.btn0 + 3 {
         return;

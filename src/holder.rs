@@ -107,6 +107,18 @@ impl Holder {
                 self.started = false;
                 let _ = ipc::send(client, ipc::TAG_CREATE_ACK, &[0]);
             }
+            ipc::TAG_DESTROY => {
+                // Explicit teardown (XInput live-disable). Resets the create
+                // key so a later CREATE rebuilds from scratch.
+                if self.uhid.is_some() {
+                    eprintln!("holder: pad destroyed on request");
+                    let _ = uhid::destroy(self.uhid.as_mut().unwrap());
+                }
+                self.uhid = None;
+                self.key = None;
+                self.neutral = None;
+                self.started = false;
+            }
             ipc::TAG_INPUT => {
                 if self.started {
                     if let Some(u) = self.uhid.as_mut() {
@@ -199,21 +211,31 @@ impl Holder {
             }
         }
     }
-
 }
 
-pub fn run() -> i32 {
+/// `instance` selects which pad this daemon holds: None/"" = the default
+/// DualSense holder (socket mdrv-ds.sock, log holder.log); "xi" = the
+/// second, XInput-emulation holder (socket mdrv-ds-xi.sock, log
+/// holder-xi.log). Behavior of the default instance is unchanged.
+pub fn run(instance: Option<&str>) -> i32 {
+    let instance = instance.unwrap_or("");
+    let log = if instance.is_empty() {
+        "holder.log"
+    } else {
+        "holder-xi.log"
+    };
     unsafe {
         libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
         libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGHUP, on_signal as *const () as libc::sighandler_t); // ignored
+        libc::signal(libc::SIGHUP, on_signal as *const () as libc::sighandler_t);
+        // ignored
     }
-    crate::proxy::tee_stderr_to_file("holder.log");
-    if ipc::connect().is_ok() {
+    crate::proxy::tee_stderr_to_file(log);
+    if ipc::connect_for(instance).is_ok() {
         eprintln!("holder: already running — nothing to do");
         return 0;
     }
-    let path = ipc::sock_path();
+    let path = ipc::sock_path_for(instance);
     let _ = fs::remove_file(&path); // stale socket from a crash
     let listener = match UnixListener::bind(&path) {
         Ok(l) => l,
@@ -292,6 +314,5 @@ pub fn run() -> i32 {
         if h.uhid.is_some() && fds[2].revents & libc::POLLIN != 0 {
             h.uhid_event(&mut client);
         }
-
     }
 }

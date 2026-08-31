@@ -181,4 +181,3 @@ fn set_cstr(buf: &mut [u8], off: usize, max: usize, s: &str) {
     let n = bytes.len().min(max - 1);
     buf[off..off + n].copy_from_slice(&bytes[..n]);
 }
-
