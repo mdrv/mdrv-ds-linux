@@ -90,7 +90,7 @@ cleanup() {
   [ -n "${GS:-}" ] && wait "$GS" 2>/dev/null
   suite_pkill
   pkill -f 'lavfi:color=blac[k]' 2>/dev/null # bg window (mpv); bracket avoids self-match
-  if pgrep -x hyprland >/dev/null 2>&1; then
+  if pgrep -x -i hyprland >/dev/null 2>&1; then
     log "Hyprland alive; restoring suite services"
     systemctl --user start "${SERVICES[@]}" 2>/dev/null || log "WARN: restart rc=$?"
   else
@@ -111,7 +111,7 @@ if [ -n "${WAYLAND_DISPLAY:-}" ] || [ -n "${DISPLAY:-}" ]; then
   printf 'mdrv-ds-gamescope: refuse to start inside a graphical session (drm backend needs a free VT). See %s\n' "$LOG" >&2
   exit 1
 fi
-if pgrep -x hyprland >/dev/null 2>&1; then
+if pgrep -x -i hyprland >/dev/null 2>&1; then
   log "note: Hyprland is running on another tty — fine, but gamescope waits"
   log "      until ITS vt is active: switch to this tty and it takes over."
 fi
