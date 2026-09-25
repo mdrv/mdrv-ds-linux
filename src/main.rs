@@ -23,6 +23,7 @@ fn main() {
         "holder" => std::process::exit(holder::run(args.get(1).map(String::as_str))),
         "keymap" => keymap_cmd(&args[1..]),
         "speaker" => speaker_cmd(&args[1..]),
+        "gain" => gain_cmd(&args[1..]),
         "xinput" => xinput_cmd(&args[1..]),
         "proxy" => {
             let mut opts = proxy::ProxyOpts {
@@ -163,6 +164,57 @@ fn speaker_cmd(rest: &[String]) {
     }
 }
 
+/// Runtime haptic-gain override (speaker pattern): writes a volatile
+/// marker file in $XDG_RUNTIME_DIR and SIGHUPs the proxy, which
+/// recomputes the live gain (`sink::current_haptic_gain`: override file
+/// first, config value as fallback). `reset` clears the override.
+fn gain_cmd(rest: &[String]) {
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let file = base.join("mdrv-ds-gain");
+    match rest.first().map(String::as_str) {
+        Some("reset") => {
+            let _ = std::fs::remove_file(&file);
+            if let Some(pid) = hup_proxy() {
+                println!("haptic_gain override cleared → config value (proxy pid {pid})");
+            }
+        }
+        None | Some("status") => {
+            let override_ = std::fs::read_to_string(&file)
+                .ok()
+                .and_then(|s| s.trim().parse::<f32>().ok());
+            let cfg = config::load();
+            let cfg_val = cfg.audio.haptic_gain.unwrap_or(1.0);
+            let pid = std::fs::read_to_string(base.join("mdrv-ds.pid"))
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok());
+            match override_ {
+                Some(o) => println!(
+                    "haptic_gain = {o:.2} (override; config says {cfg_val}) proxy pid {:?}",
+                    pid
+                ),
+                None => println!(
+                    "haptic_gain = {:.2} (config; no override) proxy pid {:?}",
+                    cfg_val, pid
+                ),
+            }
+        }
+        Some(v) => match v.parse::<f32>() {
+            Ok(g) if g.is_finite() && (0.0..=8.0).contains(&g) => {
+                std::fs::write(&file, format!("{g}")).expect("write override file");
+                if let Some(pid) = hup_proxy() {
+                    println!("haptic_gain = {g} (override) → proxy pid {pid}");
+                }
+            }
+            _ => {
+                eprintln!("invalid gain: {v} (want 0..=8)");
+                std::process::exit(2);
+            }
+        },
+    }
+}
+
 /// Runtime XInput-emulation override (speaker pattern): writes a volatile
 /// marker file in $XDG_RUNTIME_DIR and SIGHUPs the proxy, which raises or
 /// tears down the second virtual pad live (see xinput::effective). `reset`
@@ -227,6 +279,7 @@ fn usage() {
          \x20 mdrv-ds mouse [on|off|toggle|status] touchpad-as-mouse (standalone)\n\
          \x20 mdrv-ds keymap [list|reload|test <name>]   PS-chords: show / reload / fire one\n\
          \x20 mdrv-ds speaker [pad|forward|mute|reset]  live speaker_output switch (status default)\n\
+         \x20 mdrv-ds gain [0..=8|reset]            live haptic-channel gain (status default)\n\
          \x20 mdrv-ds xinput [on|off|reset]      live XInput pad emulation switch (status default)\n\
          \n\
          PROXY FLAGS:\n\

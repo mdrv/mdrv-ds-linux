@@ -61,6 +61,12 @@ Wine/games ◀── kernel evdev/hidraw ◀── PipeWire capture ◀── si
   channels on the normal system output while haptics keep riding the pad
   link (rerouting the game's stream in pavucontrol breaks rumble).
   `"pad"` (default) keeps the pad speaker; `"mute"` drops the music.
+- **Haptics gain** (`audio.haptic_gain`, default 1.0): multiplies the pad
+  stream's haptic channels (rear RL/RR) only — music passes untouched —
+  so game/system volume can drop without thinning haptics (game master
+  30% + gain 3.0 ≈ unchanged actuator swing). Live-switchable:
+  `mdrv-ds gain <0..8>|reset` (volatile override + SIGHUP; also on the
+  overlay's Controller tab).
 - **Sink** (`src/sink.rs`): captures the PipeWire stream on our impersonated
   endpoint (F32 48k quad), gates silence, encodes speaker audio as Opus CBR,
   packs RL/RR as s8 haptics into 398 B 0x36 reports, and overlays kernel
@@ -89,7 +95,7 @@ Reference implementation for the BT protocol: [vds](https://github.com/hhao14/vd
 ## Build & run
 
 ```bash
-make release        # cargo build --release + setcap cap_net_bind_service,cap_net_raw
+make release        # cargo build --release + setcap cap_net_bind_service,cap_net_raw,cap_sys_ptrace
 systemctl --user restart mdrv-ds-holder.service mdrv-ds.service
 ```
 

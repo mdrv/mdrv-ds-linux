@@ -170,6 +170,12 @@ pub struct AudioConfig {
     /// PipeWire node.name to play on when speaker_output="forward"
     /// (absent → system default output).
     pub speaker_target: Option<String>,
+    /// Gain on the pad's haptic channels (rear RL/RR pair) only, so game
+    /// or system volume can drop without thinning haptics (game master
+    /// 30% + haptic_gain 3.0 ≈ unchanged actuator swing). Music channels
+    /// pass through untouched. Live-switchable: `mdrv-ds gain <0..8>`
+    /// (volatile override + SIGHUP). Default 1.0.
+    pub haptic_gain: Option<f32>,
 }
 
 /// `[notify]` table — event callback for chord fires. The command runs via

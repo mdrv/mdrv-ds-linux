@@ -315,6 +315,11 @@ struct Shared {
     /// by the capture callback (fwd push gate) and the writer (pad-speaker
     /// Opus gate) and polled by forward_thread.
     mode: AtomicU8,
+    /// Haptic-channel gain (f32 bits) applied to the rear RL/RR pair at
+    /// capture, so game/system volume drops don't thin haptics. Written
+    /// by the proxy on RELOAD and by `mdrv-ds gain <v>`; read per audio
+    /// window by the capture callback.
+    gain: AtomicU32,
     /// True when the live pad link is L2CAP (BT interrupt channel). Chooses
     /// the wire shape `rumble()` emits: 48B 0x02 USB-style report via the
     /// out_q (L2CAP writer restamps), vs a full 78B 0x31 BT frame built with
@@ -336,6 +341,9 @@ pub const MODE_MUTE: u8 = 2;
 /// Sink handle never leaves run(), so the CLI/RELOAD paths reach the shared
 /// mode cell through this static, mirroring OUT_RELAY).
 static MODE_RELAY: Mutex<Option<Arc<Shared>>> = Mutex::new(None);
+
+/// Relay for live haptic-gain updates (same pattern as MODE_RELAY).
+static GAIN_RELAY: Mutex<Option<Arc<Shared>>> = Mutex::new(None);
 
 /// Where `mdrv-ds speaker <mode>` drops the runtime override (volatile by
 /// design: `speaker reset` or a service restart returns to config.toml).
@@ -401,6 +409,53 @@ pub fn set_speaker_mode(mode: u8) -> bool {
     match guard.as_ref() {
         Some(shared) => {
             shared.mode.store(mode, Ordering::Relaxed);
+            true
+        }
+        None => false,
+    }
+}
+
+// ---- haptic gain (live) -----------------------------------------------------
+
+fn gain_override_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("XDG_RUNTIME_DIR").map(|d| {
+        let mut p = std::path::PathBuf::from(d);
+        p.push("mdrv-ds-gain");
+        p
+    })
+}
+
+/// Clamp to the sane range; NaN/inf → 1.0.
+fn sanitize_gain(g: f32) -> f32 {
+    if g.is_finite() {
+        g.clamp(0.0, 8.0)
+    } else {
+        1.0
+    }
+}
+
+/// Effective haptic gain: runtime override file (if present) else the
+/// config value (else 1.0). Only read at sink start / reload — the hot
+/// path uses Shared.gain.
+pub fn current_haptic_gain(cfg_value: Option<f32>) -> f32 {
+    if let Some(p) = gain_override_path() {
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            if let Ok(g) = s.trim().parse::<f32>() {
+                return sanitize_gain(g);
+            }
+        }
+    }
+    sanitize_gain(cfg_value.unwrap_or(1.0))
+}
+
+/// Set the live haptic gain (no-op when no sink session is running).
+pub fn set_haptic_gain(gain: f32) -> bool {
+    let guard = GAIN_RELAY.lock().unwrap_or_else(|e| e.into_inner());
+    match guard.as_ref() {
+        Some(shared) => {
+            shared
+                .gain
+                .store(sanitize_gain(gain).to_bits(), Ordering::Relaxed);
             true
         }
         None => false,
@@ -652,6 +707,7 @@ fn spawn_sink(
         intr: Mutex::new(intr_fd),
         gen: AtomicU64::new(u64::from(pad_fd.is_some())),
         mode: AtomicU8::new(current_mode(cfg.speaker_output.as_deref())),
+        gain: AtomicU32::new(current_haptic_gain(cfg.haptic_gain).to_bits()),
         l2cap: AtomicBool::new(pad_fd.is_none()),
     });
     let _ = OUT_RELAY
@@ -662,6 +718,10 @@ fn spawn_sink(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .replace(shared.clone());
+    let _ = GAIN_RELAY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .replace(shared.clone());
     let _ = SINK_STOP
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -669,6 +729,10 @@ fn spawn_sink(
     eprintln!(
         "sink: speaker_output = {} (live-switchable: mdrv-ds speaker pad|forward|mute|reset)",
         mode_name(shared.mode.load(Ordering::Relaxed))
+    );
+    eprintln!(
+        "sink: haptic_gain = {:.2} (live-switchable: mdrv-ds gain <0..8>|reset)",
+        f32::from_bits(shared.gain.load(Ordering::Relaxed))
     );
 
     let pw_shared = shared.clone();
@@ -857,6 +921,9 @@ fn pw_thread(
             // ring (RT-safe: one lock per callback, no allocation beyond the
             // accumulator's spare capacity).
             let fwd_live = d.shared.mode.load(Ordering::Relaxed) == MODE_FORWARD;
+            // Rear-pair-only gain: FL/FR (music) pass through untouched,
+            // RL/RR (haptics) scale + clamp to the nominal F32 range.
+            let gain = f32::from_bits(d.shared.gain.load(Ordering::Relaxed));
             let mut o = start;
             let end = start + frames * stride;
             while o < end {
@@ -869,7 +936,11 @@ fn pw_thread(
                         bytes[o + k * 4 + 3],
                     ]);
                     peak_store(&PEAK_IN, s);
-                    quad[k] = s;
+                    quad[k] = if k >= 2 && gain != 1.0 {
+                        (s * gain).clamp(-1.0, 1.0)
+                    } else {
+                        s
+                    };
                 }
                 d.acc.extend_from_slice(&quad);
                 if fwd_live {

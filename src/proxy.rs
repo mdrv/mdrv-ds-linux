@@ -611,7 +611,9 @@ fn neutral_report(l: &InputLayout) -> Option<Vec<u8>> {
 /// escaping is needed. Silent when the overlay is down.
 fn pad_toast(summary: &str, body: &str) {
     use std::io::Write as _;
-    let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") else { return };
+    let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") else {
+        return;
+    };
     let path = std::path::Path::new(&dir).join("mdrv-ds-notify.sock");
     let Ok(mut s) = std::os::unix::net::UnixStream::connect(&path) else {
         return;
@@ -1364,15 +1366,19 @@ fn relay_loop(
             *stick_dz = cfg.input;
             let mode = sink::current_mode(cfg.audio.speaker_output.as_deref());
             let live = sink::set_speaker_mode(mode);
+            let gain = sink::current_haptic_gain(cfg.audio.haptic_gain);
+            let gain_live = sink::set_haptic_gain(gain);
             eprintln!(
-                "config reloaded: {} chord(s), ps={}, sticks(enabled={}, inner={:.2}, outer={:.2}), speaker={}{}",
+                "config reloaded: {} chord(s), ps={}, sticks(enabled={}, inner={:.2}, outer={:.2}), speaker={}{}, gain={:.2}{}",
                 chords.bindings.len(),
                 if *ps_swallow { "swallow" } else { "pass" },
                 stick_dz.enabled,
                 stick_dz.inner_dz,
                 stick_dz.outer_dz,
                 sink::mode_name(mode),
-                if live { " (live)" } else { "" }
+                if live { " (live)" } else { "" },
+                gain,
+                if gain_live { " (live)" } else { "" }
             );
             // XInput emulation live-switch (override file + SIGHUP):
             // raise or tear down the second virtual pad in place.
