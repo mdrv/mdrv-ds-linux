@@ -4,43 +4,61 @@ Windows games running under Wine/Proton, by patching the gate checks that stop
 the games' DualSense audio-endpoint shoppers / pad libraries from working when
 the controller is not genuinely USB-connected.
 
+Sites are located by BYTE-PATTERN SCAN (AOB with ?? wildcards), not hardcoded
+offsets: GE-Proton recompiles shift code around, so a site is found wherever
+its instruction shape lives. Wildcards cover legitimately volatile bytes
+(rip-relative displacements, stack sizes). Replacement templates may contain
+?? too, meaning "copy the matched byte" — so only the semantics we intend to
+change are written, and a replacement can never spill past the matched region
+(repl length == pattern length is asserted).
+
 Profiles
     ff16         FINAL FANTASY XVI (ffxvi.exe)
                  The game re-inits its audio devices only when the WASAPI render
                  endpoint count changes after launch; over BT it never does, so
-                 the DualSense endpoint shopper never runs. Four conditional
-                 jumps guarding shopper Init (fn @VA 0x1410410a0) are NOPed so
-                 the shopper always runs and finds the "...Wireless Controller"
-                 endpoint (our PipeWire sink impersonation).
+                 the DualSense endpoint shopper never runs. One gate block
+                 (VA 0x141041135..0x14104117f) holds four conditional jumps
+                 guarding shopper Init; all four are NOPed so the shopper always
+                 runs and finds the "...Wireless Controller" endpoint (our
+                 PipeWire sink impersonation). Matched as a single 75-byte block
+                 with the call/mov displacements wildcarded.
 
     stellarblade Stellar Blade (Engine/Binaries/ThirdParty/LibScePad_PS5/bin/
                  libScePad.dll)
                  Sony's libScePad classifies a pad as Bluetooth unless a HID
                  caps probe succeeds, and scePadIsSupportedAudioFunction()
-                 returns false for BT pads -> no haptics/speaker. The `jle`
-                 that routes DS5 pads down the BT path (@VA 0x18000463c) is
-                 NOPed (classification stays Bluetooth so BT-shaped reports
-                 parse correctly), and the bus check in
-                 scePadIsSupportedAudioFunction (@VA 0x18000ae30) is NOPed so
-                 BT pads get haptics/speaker.
+                 returns false for BT pads -> no haptics/speaker. The jcc after
+                 `cmp [rbx+0x64],esi` (@VA 0x18000ae30) is NOPed so BT-classified
+                 pads get the audio function. Classification itself stays natural
+                 (BT rdesc -> BT parses 0x31 reports; USB rdesc -> USB).
 
     ge-winepulse GE-Proton winepulse.so: get_container_id() stubbed to return
-                 a constant container GUID for every audio endpoint (virtual
-                 endpoints have no udev usb_device parent, so Wine derived
-                 GUID_NULL and the game's pad<->endpoint container match
-                 always failed).
+                 a constant container GUID {0CE6054C-0000-FFFF-C0FF-EE0CE6054C00}
+                 for every audio endpoint (virtual endpoints have no udev
+                 usb_device parent, so Wine derived GUID_NULL and the game's
+                 pad<->endpoint container match always failed). Second site
+                 strips PA_STREAM_DONT_MOVE from specific-device streams so
+                 pactl/pavucontrol moves work under pipewire-pulse.
 
     ge-winebus   GE-Proton winebus.sys: make_unique_container_id() patched to
                  stamp the pad with the same constant GUID every reconnect,
-                 plus the bus_type_str[] "BTHENUM" entry rewritten to "USB"
-                 so the pad's Windows device ancestry reads USB\VID_....
+                 plus the bus_type_str[] "BTHENUM" entry rewritten to "USB" so
+                 the pad's Windows device ancestry reads USB\VID_054C&PID_0CE6.
+                 HISTORICAL GOTCHA: the replacement must be EXACTLY len(pattern)
+                 bytes. The old 11-6 patch was 17 bytes longer, tuned to 11-6's
+                 code layout; on 11-7 that overshoot NOPed live instructions
+                 (test/je/store block) and Wine stopped enumerating the pad
+                 entirely — no gamepad input in any game. The scanner enforces
+                 repl-length == pattern-length, so this class of bug is now
+                 structurally impossible.
 
 Usage
-    ds5-haptics-patch [status|patch|restore] [profile...] [--path FILE]
+    ds5-haptics-patch [status|patch|restore|doctor] [profile...] [--path FILE]
 
     status   (default) show per-site state; all profiles if none given
     patch    back up (<file>.hapticsbak) and apply
     restore  copy the backup back over the target
+    doctor   pattern-health report: match counts, chosen offsets, drift
     --path   explicit binary path (overrides profile default)
 
 Requires: python-pefile (pacman -S python-pefile) — only for the PE-based
@@ -57,18 +75,37 @@ try:
 except ImportError:
     pefile = None
 
-# (name, default path, imagebase, [(va, orig_hex, repl_hex)], doc)
+GUID_STUB = "48b84c05e60c0000ffff48bac0ffee0ce6054c00c3"
+
+# ge-winebus site 1: make_unique_container_id store sequence. Fixed parts are
+# the DEVICE_EXTENSION offsets (0x44/0x6a/0x50 read, 0x694/0x698/0x69c write);
+# volatile parts (lea disp8, call disp32, mov rbp disp8) are wildcarded.
+# 11-7 note: repl is 37 B of constant stores + 21 NOP = exactly 58 B. NEVER
+# let it exceed the matched length — see the 11-6 overshoot horror story above.
+WB1_PAT = ("0fb74644488d4d??c1e21009d00fb796a40600008986940600000fb74650"
+           "c1e01009d0898698060000ff15????????488b45??4889869c060000")
+WB1_REPL = ("c786940600004c05e60cc786980600000000ffff48b8c0ffee0ce605"
+            "4c004889869c060000" + "90" * 21)
+
+# ff16 gate block (75 B): four 6-byte gate jumps as NOP slots; every other
+# displacement (call rel32, mov [rip+disp32]) wildcarded and copy-preserved.
+_S = "?" * 12
+_E = "e8" + "?" * 8
+_M1 = "8905" + "?" * 8
+_M2 = "8b0d" + "?" * 8
+_T = "488d55ef66c745ef7fffc645f2ff"
+_N = "90" * 6
+FF_PAT = _S + _E + _M1 + "85c0" + _S + "8bd38bc8" + _E + "85c0" + _S + _M2 + _T + _E + "85c0" + _S
+FF_REPL = _N + _E + _M1 + "85c0" + _N + "8bd38bc8" + _E + "85c0" + _N + _M2 + _T + _E + "85c0" + _N
+
 PROFILES = {
     "ff16": dict(
-        path="/mnt/label/ESD380C-E4/n/games/pc/finalfantasyxvi/prefix/drive_c/"
+        path="/home/ua/n/games/pc/finalfantasyxvi/prefix/drive_c/"
              "Games/FINAL FANTASY XVI/ffxvi.exe",
         base=0x140000000,
-        nop=b"\x90",
         sites=[
-            (0x141041135, "0f853c030000", "909090909090"),
-            (0x141041148, "0f8e29030000", "909090909090"),
-            (0x141041159, "0f8818030000", "909090909090"),
-            (0x14104117a, "0f88f7020000", "909090909090"),
+            dict(hint=0x141041135, pattern=FF_PAT, repl=FF_REPL,
+                 note="shopper-Init gate block: NOP the four gate jumps"),
         ],
         doc="NOP the four shopper-Init gate jumps (endpoint-count/bus checks)",
     ),
@@ -78,76 +115,145 @@ PROFILES = {
              "libScePad.dll",
         base=0x180000000,
         sites=[
-            # audio gate only: NOP the jne after `cmp [ctx+0x64],0` in
+            # audio gate only: NOP the jcc after `cmp [rbx+0x64],esi` in
             # scePadIsSupportedAudioFunction so BT-classified pads get
             # haptics/speaker. Classification itself stays natural (HID caps
             # probe): BT rdesc -> BT (parses 0x31 reports), USB rdesc -> USB.
             # Forcing classification broke whichever transport it didn't match.
-            (0x18000ae30, "397364755a", "3973649090"),
+            dict(hint=0x18000ae30, pattern="397364????", repl="3973649090",
+                 note="grant audio function to BT-classified pads"),
         ],
         doc="grant audio function to BT-classified pads (classification natural)",
     ),
-    # --- GE-Proton companion patches (raw file-offset sites; ELF or PE) ---
-    #
-    # The mdrv-ds PipeWire sink impersonates the DualSense USB audio device
-    # (device.bus=usb, vendor/product 054c:0ce6, sysfs.path). These two
-    # binary patches give BOTH sides of the Wine container-ID match a fixed
-    # GUID {0CE6054C-0000-FFFF-C0FF-EE0CE6054C00}:
-    #
-    #   winepulse.so get_container_id() normally derives an endpoint's
-    #   container from the udev usb_device parent (PRODUCT/BUSNUM/DEVNUM/
-    #   USEC_INITIALIZED); virtual endpoints have no such parent and got
-    #   GUID_NULL. The stub returns the constant for every endpoint.
-    #
-    #   winebus.sys make_unique_container_id() stamps the pad with a fresh
-    #   tick-based GUID per reconnect; patched to the same constant.
-    #
-    #   Plus: bus_type_str[] "BTHENUM" -> "USB" so the pad's Windows
-    #   ancestry reads USB\VID_054C&PID_0CE6\... (games walking
-    #   CM_Get_Parent see a USB parent).
-    #
-    # Haptics were verified working WITH all three installed; they were
-    # never isolated one-by-one. Do not selectively revert without testing.
     "ge-winepulse": dict(
+        raw=True,
         path="/home/ua/.config/heroic/tools/proton/GE-Proton-latest/files/"
              "lib/wine/x86_64-unix/winepulse.so",
-        raw=True,
         sites=[
-            (0xc1e0,
-             "554889e541574156415541544989fc534881ec2810",
-             "48b84c05e60c0000ffff48bac0ffee0ce6054c00c3"),
+            dict(hint=0xC1E0,
+                 pattern="554889e541574156415541544989fc534881ec????",
+                 repl=GUID_STUB,
+                 note="get_container_id -> constant DualSense container GUID"),
             # pulse_stream_connect_timeout: when a specific device was
             # requested wine sets flags |= PA_STREAM_DONT_MOVE (0x200),
             # which pipewire-pulse maps to node.dont-reconnect -> all
             # pactl/pavucontrol moves of game streams fail with EINVAL.
             # 0x12201 (base|DONT_MOVE) -> 0x12001 (base). One byte: 0x22->0x20.
-            (0x888c,
-             "22",
-             "20"),
+            dict(hint=0x888C,
+                 pattern="740b41803e00b901??0100746f8b3348",
+                 repl="????????????????20??????????????",
+                 note="drop PA_STREAM_DONT_MOVE on specific-device streams"),
         ],
         doc="get_container_id stub -> constant DualSense container GUID",
     ),
     "ge-winebus": dict(
+        raw=True,
         path="/home/ua/.config/heroic/tools/proton/GE-Proton-latest/files/"
              "lib/wine/x86_64-windows/winebus.sys",
-        raw=True,
         sites=[
-            # make_unique_container_id store sequence -> constant GUID
-            (0x1b32,
-             "0fb74644488d4dd8c1e21009d00fb796a40600008986940600000fb7"
-             "4650c1e01009d0898698060000ff1507e80000488b45d84889869c06"
-             "0000",
-             "c786940600004c05e60cc786980600000000ffff48b8c0ffee0ce605"
-             "4c004889869c06000090909090909090909090909090909090909090"
-             "90909090909090909090909090909090909090"),
-            # bus_type_str[] entry: UTF-16LE "BTHENUM" -> "USB" + NUL padding
-            (0xb6ac,
-             "42005400480045004e0055004d000000",
-             "55005300420000000000000000000000"),
+            dict(hint=0x1B32, pattern=WB1_PAT, repl=WB1_REPL,
+                 note="make_unique_container_id -> constant GUID (exact length!)"),
+            dict(hint=0xC6E4,
+                 pattern="42005400480045004e0055004d000000",
+                 repl="55005300420000000000000000000000",
+                 note='bus_type_str[] "BTHENUM" -> "USB"'),
         ],
         doc="constant pad container GUID + USB ancestry string",
     ),
 }
+
+
+def toks(s):
+    return [s[i:i + 2] for i in range(0, len(s), 2)]
+
+
+def assert_site(site):
+    """A site is valid iff pattern and repl token streams have equal length."""
+    p, r = toks(site["pattern"]), toks(site["repl"])
+    if len(p) != len(r):
+        raise ValueError(f"pattern/repl length mismatch: {len(p)} vs {len(r)} "
+                         f"({site.get('note', '?')})")
+    return len(p)
+
+
+def anchor_range(t):
+    """Longest run of fixed (non-??) tokens — the scan anchor."""
+    best = (0, 0)
+    i = 0
+    while i < len(t):
+        if t[i] != "??":
+            j = i
+            while j < len(t) and t[j] != "??":
+                j += 1
+            if j - i > best[1] - best[0]:
+                best = (i, j)
+            i = j
+        else:
+            i += 1
+    return best
+
+
+def aob(data, pat):
+    """All offsets where the wildcarded hex pattern matches. Empty -> drift."""
+    t = toks(pat)
+    a0, a1 = anchor_range(t)
+    if a1 == a0:
+        return []  # fully-wildcarded pattern would match everywhere: refuse
+    anc = bytes(int(x, 16) for x in t[a0:a1])
+    pre = a0
+    n = len(t)
+    hits = []
+    pos = 0
+    while True:
+        pos = data.find(anc, pos)
+        if pos == -1:
+            break
+        st = pos - pre
+        if st >= 0 and st + n <= len(data) and all(
+                t[k] == "??" or data[st + k] == int(t[k], 16) for k in range(n)):
+            hits.append(st)
+        pos += 1
+    return hits
+
+
+def render(pat, match, repl):
+    """Build replacement from the template: fixed hex written, ?? copies match."""
+    rt = toks(repl)
+    return bytes(m if r == "??" else int(r, 16)
+                 for m, r in zip(match, rt))
+
+
+def site_state(data, site, hint_off):
+    """Resolve one site. Returns dict with state, offset, diagnostics.
+
+    States: patched | original | lost (pattern absent) | ambiguous (refused)
+    """
+    n = assert_site(site)
+    matches = aob(data, site["pattern"])
+    if not matches:
+        # pattern gone: maybe fully-fixed repl present (e.g. stub replaced a
+        # prologue whose shape changed but our bytes are still there)
+        rt = toks(site["repl"])
+        if "??" not in rt:
+            fixed = bytes(int(x, 16) for x in rt)
+            pos = data.find(fixed)
+            if pos != -1:
+                return dict(state="patched", off=pos, matches=[],
+                            extra="pattern gone, replacement found (upstream "
+                                  "rewrote the original code — re-derive soon)")
+        return dict(state="lost", off=None, matches=matches,
+                    extra="pattern not found — binary changed, re-derive needed")
+    if len(matches) > 1:
+        pick = min(matches, key=lambda o: abs(o - hint_off))
+        extra = f"{len(matches)} matches, closest to hint chosen: " + \
+                ", ".join(hex(o) for o in matches)
+    else:
+        pick = matches[0]
+        extra = ""
+    cur = bytes(data[pick:pick + n])
+    want = render(site["pattern"], cur, site["repl"])
+    return dict(state="patched" if cur == want else "original",
+                off=pick, matches=matches, extra=extra)
 
 
 def va_to_offset(pe, imagebase, va):
@@ -159,30 +265,22 @@ def va_to_offset(pe, imagebase, va):
     return None
 
 
-def site_state(data, off, orig, repl):
-    cur = data[off : off + len(orig)]
-    if cur == orig:
-        return "original", cur
-    if cur == repl:
-        return "patched", cur
-    return "MISMATCH", cur
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("action", nargs="?", default="status",
-                    choices=["status", "patch", "restore"])
-    ap.add_argument("profile", nargs="?", default=None, choices=list(PROFILES))
+                    choices=["status", "patch", "restore", "doctor"])
+    ap.add_argument("profile", nargs="*", default=None, choices=list(PROFILES))
     ap.add_argument("--path", help="explicit target binary path")
     args = ap.parse_args()
 
-    names = [args.profile] if args.profile else list(PROFILES)
+    names = args.profile or list(PROFILES)
     rc = 0
     for name in names:
         prof = PROFILES[name]
         target = args.path or prof["path"]
         bak = target + ".hapticsbak"
+        pe_mode = not prof.get("raw")
 
         if args.action == "restore":
             if not os.path.exists(bak):
@@ -198,68 +296,107 @@ def main():
             rc = 1
             continue
 
-        data = bytearray(open(target, "rb").read())
-        states = []
-        for site in prof["sites"]:
-            va, orig_hex = site[0], site[1]
-            site_repl = site[2] if len(site) > 2 else None
-            if prof.get("raw"):
-                off = va
-                orig = bytes.fromhex(orig_hex)
-                repl = bytes.fromhex(site_repl)  # raw sites always carry repl
-            else:
-                if pefile is None:
-                    print(f"[{name}] error: python-pefile required "
-                          f"(pacman -S python-pefile)")
-                    rc = 1
-                    break
-                pe = pefile.PE(target, fast_load=True)
-                base = pe.OPTIONAL_HEADER.ImageBase
-                off = va_to_offset(pe, base, va)
-                if off is None:
-                    print(f"[{name}] {va:#x}: VA not in any section")
-                    rc = 1
-                    break
-                orig = bytes.fromhex(orig_hex)
-                repl = bytes.fromhex(site_repl if site_repl else prof["repl"])
-            state, cur = site_state(data, off, orig, repl)
-            states.append((va, off, orig, repl, state, cur))
-        else:
-            label = ", ".join(f"{va:#x}:{st}" for va, _, _, _, st, _ in states)
-            print(f"[{name}] {os.path.basename(target)}  {prof['doc']}")
-            print(f"[{name}]   {label}")
-
-            if args.action == "status":
-                all_p = all(st == "patched" for *_, st, _ in states)
-                all_o = all(st == "original" for *_, st, _ in states)
-                print(f"[{name}]   => {'PATCHED' if all_p else 'UNPATCHED' if all_o else 'PARTIAL/MISMATCH'}")
+        pe = None
+        if pe_mode:
+            if pefile is None:
+                print(f"[{name}] error: python-pefile required "
+                      f"(pacman -S python-pefile)")
+                rc = 1
                 continue
+            pe = pefile.PE(target, fast_load=True)
+        data = open(target, "rb").read()
 
-            if args.action == "patch":
-                if any(st == "MISMATCH" for *_, st, _ in states):
-                    print(f"[{name}] ERROR: bytes differ from known original/patched "
-                          f"— game updated? Aborting.")
-                    rc = 1
-                    continue
-                if all(st == "patched" for *_, st, _ in states):
-                    print(f"[{name}] already patched")
-                    continue
-                if not os.path.exists(bak):
-                    shutil.copy2(target, bak)
-                    print(f"[{name}] backup written: {bak}")
-                changed = False
-                for va, off, orig, repl, st, _ in states:
-                    if st == "original":
-                        data[off : off + len(orig)] = repl
-                        changed = True
-                        print(f"[{name}] patched {va:#x} (file offset {off:#x}): "
-                              f"{orig.hex()} -> {repl.hex()}")
-                    else:
-                        print(f"[{name}] kept    {va:#x} (already patched)")
-                if changed:
-                    with open(target, "r+b") as f:
-                        f.write(data)
-                    print(f"[{name}] PATCHED OK")
+        states = []
+        ok = True
+        for site in prof["sites"]:
+            hint = site["hint"]
+            hint_off = hint if not pe_mode else va_to_offset(pe, prof["base"], hint)
+            st = site_state(data, site, hint_off if hint_off is not None else hint)
+            st["hint"], st["hint_off"], st["va"] = hint, hint_off, hint
+            states.append(st)
+            if st["state"] in ("lost", "ambiguous"):
+                ok = False
+
+        docline = f"[{name}] {os.path.basename(target)}  {prof['doc']}"
+        print(docline)
+        verbose = args.action in ("doctor",) or any(
+            st["state"] in ("lost",) or st["extra"] for st in states)
+        for st in states:
+            if st["state"] in ("lost",):
+                print(f"[{name}]   @{st['va']:#x}: LOST — {st['extra']}")
+                continue
+            off = st["off"]
+            if verbose:
+                delta = (off - st["hint_off"]) if (pe_mode or True) and \
+                                                 st["hint_off"] is not None else None
+                d = f" (hint {st['hint']:#x}, delta {delta:+#x})" if delta else \
+                    f" (hint {st['hint']:#x})"
+                print(f"[{name}]   @{st['va']:#x}: {st['state']} at {off:#x}{d}"
+                      f"{' — ' + st['extra'] if st['extra'] else ''}"
+                      f" — {site_note(prof, st)}")
+            else:
+                print(f"[{name}]   @{st['va']:#x}:{st['state']}")
+
+        all_p = all(st["state"] == "patched" for st in states if st["state"] != "lost")
+        all_o = all(st["state"] == "original" for st in states if st["state"] != "lost")
+        if args.action == "doctor":
+            print(f"[{name}]   => doctor: {'HEALTHY' if ok else 'DRIFT — re-derive needed'}")
+            if not ok:
+                rc = 1
+            continue
+
+        if args.action == "status":
+            if not ok:
+                print(f"[{name}]   => PATTERN LOST — run doctor, re-derive needed")
+                rc = 1
+            else:
+                print(f"[{name}]   => {'PATCHED' if all_p else 'UNPATCHED' if all_o else 'PARTIAL/MISMATCH'}")
+            continue
+
+        if args.action == "patch":
+            if not ok:
+                print(f"[{name}] ERROR: pattern lost — binary changed? "
+                      f"Run doctor and re-derive. Aborting.")
+                rc = 1
+                continue
+            if all(st["state"] == "patched" for st in states):
+                print(f"[{name}] already patched")
+                continue
+            if not os.path.exists(bak):
+                shutil.copy2(target, bak)
+                print(f"[{name}] backup written: {bak}")
+            changed = False
+            out = bytearray(data)
+            for st in states:
+                if st["state"] == "original":
+                    off, n = st["off"], assert_site(site_by(prof, st))
+                    repl = render(site_by(prof, st)["pattern"],
+                                  bytes(data[off:off + n]),
+                                  site_by(prof, st)["repl"])
+                    out[off:off + n] = repl
+                    changed = True
+                    print(f"[{name}] patched {st['va']:#x} (file offset {off:#x}): "
+                          f"{len(repl)} bytes written")
+                else:
+                    print(f"[{name}] kept    {st['va']:#x} (already patched)")
+            if changed:
+                with open(target, "r+b") as f:
+                    f.write(out)
+                print(f"[{name}] PATCHED OK")
+
+
+def site_note(prof, st):
+    for s in prof["sites"]:
+        if s["hint"] == st["hint"]:
+            return s.get("note", "")
+    return ""
+
+
+def site_by(prof, st):
+    for s in prof["sites"]:
+        if s["hint"] == st["hint"]:
+            return s
+    raise KeyError(st)
 
 
 if __name__ == "__main__":
