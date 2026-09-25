@@ -35,7 +35,6 @@ pub const TAG_SET_REQ: u8 = b'T';
 pub const TAG_NOTICE: u8 = b'X';
 const MAX_FRAME: usize = 16384;
 
-
 /// Instance-aware socket path: "" is the default DualSense holder,
 /// "xi" is the second (XInput) holder — separate socket, separate pad,
 /// zero interaction with the default instance.
@@ -73,7 +72,6 @@ pub fn recv<R: Read>(r: &mut R) -> io::Result<(u8, Vec<u8>)> {
     r.read_exact(&mut buf)?;
     Ok((buf[0], buf[1..].to_vec()))
 }
-
 
 pub fn connect_for(instance: &str) -> io::Result<UnixStream> {
     UnixStream::connect(sock_path_for(instance))

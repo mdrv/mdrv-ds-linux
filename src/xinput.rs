@@ -34,7 +34,7 @@ pub const XINPUT_RDESC: &[u8] = &[
     0xff, 0x7f, 0x36, 0x00, 0x80, 0x46, 0xff, 0x7f, 0x05, 0x01, 0x09, 0x01, 0xa1, 0x00, 0x95, 0x02,
     0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x81, 0x02, 0xc0, 0x05, 0x01, 0x09, 0x01, 0xa1, 0x00, 0x95,
     0x02, 0x05, 0x01, 0x09, 0x33, 0x09, 0x34, 0x81, 0x02, 0xc0, 0xc0, 0x06, 0x00, 0xff, 0x09, 0x01,
-    0x15, 0x00, 0x26, 0xff, 0x00, 0x75, 0x08, 0x95, 0x08, 0x91, 0x02, 0xc0
+    0x15, 0x00, 0x26, 0xff, 0x00, 0x75, 0x08, 0x95, 0x08, 0x91, 0x02, 0xc0,
 ];
 
 /// Live override file (mirrors the speaker pattern): "on"/"off" wins over
@@ -106,19 +106,43 @@ pub fn translate(report: &[u8], l: &InputLayout) -> [u8; 14] {
         7 => 0x05, // NW
         _ => 0x00, // released (0x08) / fault
     };
-    if b1 & 0x20 != 0 { r[2] |= 0x10; } // options → start
-    if b1 & 0x10 != 0 { r[2] |= 0x20; } // create/share → back
-    if b2 & 0x02 != 0 { r[2] |= 0x20; } // touchpad click → back (same as share)
-    if b1 & 0x40 != 0 { r[2] |= 0x40; } // L3
-    if b1 & 0x80 != 0 { r[2] |= 0x80; } // R3
-    if b1 & 0x01 != 0 { r[3] |= 0x01; } // L1 → LB
-    if b1 & 0x02 != 0 { r[3] |= 0x02; } // R1 → RB
-    if b2 & 0x01 != 0 { r[3] |= 0x04; } // PS → guide
-    if b0 & 0x20 != 0 { r[3] |= 0x10; } // cross → A
-    if b0 & 0x40 != 0 { r[3] |= 0x20; } // circle → B
-    if b0 & 0x10 != 0 { r[3] |= 0x40; } // square → X
-    if b0 & 0x80 != 0 { r[3] |= 0x80; } // triangle → Y
-    r[4] = get(l.trig0);    // L2 → LT
+    if b1 & 0x20 != 0 {
+        r[2] |= 0x10;
+    } // options → start
+    if b1 & 0x10 != 0 {
+        r[2] |= 0x20;
+    } // create/share → back
+    if b2 & 0x02 != 0 {
+        r[2] |= 0x20;
+    } // touchpad click → back (same as share)
+    if b1 & 0x40 != 0 {
+        r[2] |= 0x40;
+    } // L3
+    if b1 & 0x80 != 0 {
+        r[2] |= 0x80;
+    } // R3
+    if b1 & 0x01 != 0 {
+        r[3] |= 0x01;
+    } // L1 → LB
+    if b1 & 0x02 != 0 {
+        r[3] |= 0x02;
+    } // R1 → RB
+    if b2 & 0x01 != 0 {
+        r[3] |= 0x04;
+    } // PS → guide
+    if b0 & 0x20 != 0 {
+        r[3] |= 0x10;
+    } // cross → A
+    if b0 & 0x40 != 0 {
+        r[3] |= 0x20;
+    } // circle → B
+    if b0 & 0x10 != 0 {
+        r[3] |= 0x40;
+    } // square → X
+    if b0 & 0x80 != 0 {
+        r[3] |= 0x80;
+    } // triangle → Y
+    r[4] = get(l.trig0); // L2 → LT
     r[5] = get(l.trig0 + 1); // R2 → RT
     let fwd = |v: u8| -> i16 { (((v as i32) - 128) * 257).clamp(-32768, 32767) as i16 };
     // stick up = 0x00 on the wire; xpad convention is up = +32767
